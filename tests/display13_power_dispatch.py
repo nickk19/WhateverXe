@@ -59,6 +59,11 @@ struct XE {
  bool restoreDisplay13Ports(IOService*){assert(!held);return portsReady;}
  static bool prepareDisplay13Wake(IOService*){return hardwareReady;}
  static void recordDSIClient(IOService*,unsigned,uint32_t,uint32_t){}
+ // -wex-edp-blank (kern_xe.cpp) is asked first on every non-DSI callback; its
+ // own decisions are covered by display13_edp_keep_route.
+ static inline bool blankHandles=false;static inline unsigned blankCalls=0;
+ static bool display13EDPBlankPower(IOService*,uint32_t,uint32_t &result){
+  ++blankCalls;if(blankHandles)result=kIOReturnSuccess;return blankHandles;}
  bool ownedDisplay13Framebuffer(IOService*)const;
  bool finishDisplay13SystemWake(IOService*,bool=false);
  static uint32_t wrapDisplay13SetPowerState(IOService*,uint32_t);
@@ -134,6 +139,14 @@ int main(){
   assert(nativeCalls==1 && !wakes[0] && !wakes[1]);}
  {Fixture f;IOService foreign;put(foreign,0x4284,2U);
   assert(XE::wrapDisplay13SetPowerState(&foreign,2)==0 && !wakes[0]);}
+ // Declined, every callback above took the native path. A display sleep the
+ // blank handles skips the donor's transition, so neither WillPowerOff nor
+ // DidPowerOn is owed; a later system wake still completes on the native path.
+ {Fixture f;assert(XE::blankCalls);XE::blankHandles=true;put(f.fb[0],0x4284,2U);
+  assert(XE::wrapDisplay13SetPowerState(&f.fb[0],1)==0 && XE::wrapDisplay13SetPowerState(&f.fb[0],2)==0);
+  assert(!nativeCalls && !wakes[0] && !ons[0] && !f.xe.displayWakeEventBusy);
+  XE::blankHandles=false;put(f.fb[0],0x4284,0U);display13FBPower.restoreEpoch=2;
+  assert(XE::wrapDisplay13SetPowerState(&f.fb[0],2)==0 && nativeCalls==1 && wakes[0]==1 && ons[0]==1);}
  assert(!held);puts("PASS production native power -> common completion, all subscriber states/orders; no DSI required");
 }
 '''.replace('FUNCTIONS', functions)
