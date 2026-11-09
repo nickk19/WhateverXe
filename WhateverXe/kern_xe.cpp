@@ -7636,8 +7636,9 @@ uint8_t *XE::display13SSTPort(void *port) {
 
 // At the firmware handoff a Combo eDP port still has native mode 0: Apple's setPortMode has not run yet, and
 // display13SSTPort requires exactly 1 (the AUX gate already accepts 0 or 1 on Combo ports). Admit that one case for the
-// handoff only: the same terms, on the DDI the VBT names as the panel. Every other caller keeps the exact check, and
-// Raptor Lake-U stays on the boot framebuffer until its display clock is implemented.
+// handoff only: the same terms, on the DDI the VBT names as the panel. Every other caller keeps the exact check.
+// Raptor Lake-U is left out: its display clock is implemented, but no Raptor Lake-U eDP panel has run this
+// admission (the validated U300 panel is DSI), and without it such a board keeps its boot framebuffer.
 uint8_t *XE::display13PanelBootPort(void *port) {
  auto s=callbackXE;auto &c=display13FBPower;auto object=static_cast<OSObject *>(port);
  if(!s->display13FramebufferRequested || s->xeProfile.display!=XELP::Display::XeLPD || XELP::raptorLakeUDevice(s->xeProfile.identity) ||
