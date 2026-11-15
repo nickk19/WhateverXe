@@ -22,6 +22,7 @@ code=code.replace('struct XE {','''struct XE {
  uintptr_t orgDisplay13PortTraining=0,orgTGLPathLookup=0,tglPortByDDI=0,display13DPImage=0;
  static uint32_t wrapDisplay13PortTraining(void*,void*);
  static bool display13DeferClock(void*,uint64_t,uint32_t,uintptr_t);
+ static inline unsigned trained=0;static void display13EDPTrained(void*){assert(!locked);++trained;}
 '''.replace('LEASE',lease))
 code=code.replace('static bool display13StopTranscoder(void*){assert(false);return false;}','static bool display13StopTranscoder(void*);')
 code=code.replace('static bool display13TrainingPath(void*,uint32_t&,uint32_t&){return false;}','static bool display13TrainingPath(void*,uint32_t&,uint32_t&);')
@@ -38,6 +39,7 @@ extra=r'''
 void *testPort;void *testLookup(void*p){return p==testPort?currentPath:nullptr;}
 void *testByDDI(unsigned ddi){return Display13FBMemory::field<unsigned>(testPort,0x120)==ddi?testPort:nullptr;}
 unsigned nativeTrain(void*p,void*){assert(p==testPort&&!locked);return XE::wrapDisplay13TrainingPattern(currentPath,1);}
+unsigned failedTrain(void*p,void*){assert(p==testPort&&!locked);return 0xE00002BCU;}
 int main(){IORecursiveLock pool;
  for(unsigned ddi:{0U,1U,3U,4U,5U,6U})for(unsigned pipe=0;pipe<3;++pipe)for(unsigned cap=0;cap<2;++cap)for(unsigned wanted=0;wanted<2;++wanted){
   Fixture f(2-pipe,pipe,ddi);Map map;setup(f,map,ddi,pipe,4,6,ddi<2);testPort=f.port;
@@ -51,7 +53,12 @@ int main(){IORecursiveLock pool;
   lease.trainingThread=nullptr;assert(!XE::display13TrainingPath(f.path,d,p));lease.trainingThread=current_thread();
   lease.adopted=true;assert(!XE::display13TrainingPath(f.path,d,p));lease.adopted=false;
   put(f.fb,0x49e8,1U);assert(!XE::display13TrainingPath(f.path,d,p));put(f.fb,0x49e8,0U);
+  const auto trained=XE::trained;
   assert(!XE::wrapDisplay13PortTraining(f.port,nullptr));assert(f.port[0x11a]==(cap&wanted));
+  assert(XE::trained==trained+1);  // after a successful native training, outside the lock
+  state.orgDisplay13PortTraining=(uintptr_t)failedTrain;
+  assert(XE::wrapDisplay13PortTraining(f.port,nullptr)==0xE00002BCU && XE::trained==trained+1);
+  state.orgDisplay13PortTraining=(uintptr_t)nativeTrain;
   assert((map.regs[0x60540+0x1000*pipe]&0x40000U)==((cap&wanted)<<18));
   const auto clock=0x46140+4*pipe;assert(map.regs[clock]==((ddi+(ddi>=3?3:1))<<28));
   assert(!XE::display13DeferClock(f.access,clock,0,state.display13DPImage+0x4d991));

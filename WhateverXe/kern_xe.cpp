@@ -7448,12 +7448,39 @@ static uint32_t display13EDPLinkConfigs=0,display13EDPLinkLast[3]={UINT32_MAX,0,
 // The last TRAINING_PATTERN_SET sent with TRAINING_LANEx_SET: microseconds the
 // clock recovery waited for the DDI buffer, waits that timed out, the result.
 static uint32_t display13EDPOrderLast[3]={0,0,UINT32_MAX};
+static Display13EDPLink::Backlight display13EDPBacklight;
+// Brightness over AUX turned back on: count, then the last 0x344 and level the
+// panel reported, whether the level was written, the result, 0x344 read back,
+// the milliseconds waited for the interface (UINT32_MAX: it never came).
+static uint32_t display13EDPBacklightRestores=0;
+static uint32_t display13EDPBacklightLast[6]={UINT32_MAX,UINT32_MAX,0,UINT32_MAX,UINT32_MAX,UINT32_MAX};
+// Intel's OUI written to the panel: count and last result; donor source
+// identifications kept off the panel.
+static uint32_t display13EDPOUIWrites=0,display13EDPOUILast=UINT32_MAX,display13EDPOUIReplaced=0;
+static void display13EDPBacklightPublish() {
+ const auto &b=display13EDPBacklight;const auto *l=display13EDPBacklightLast;
+ uint32_t record[17]={2,b.known,b.firmwareAux,b.firmwareOUI,b.firmwareControl,b.firmwareNits,b.lastNits,
+  display13EDPBacklightRestores,l[0],l[1],l[2],l[3],l[4],l[5],display13EDPOUIWrites,display13EDPOUILast,display13EDPOUIReplaced};
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPBacklight",record,sizeof(record));
+}
 static void display13EDPLinkPublish() {
  const auto &o=display13EDPOrder;
  uint32_t record[15]={2,display13EDPLink.assrHidden,display13EDPLink.intervalMasked,display13EDPLinkConfigs,
   display13EDPLinkLast[0],display13EDPLinkLast[1],display13EDPLinkLast[2],display13EDPLink.tps4Hidden,
   o.holds,o.joined,o.delivered,o.replaced,display13EDPOrderLast[0],display13EDPOrderLast[1],display13EDPOrderLast[2]};
  IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPLink",record,sizeof(record));
+}
+// Intel's OUI on the panel, written only when the panel does not have it
+// (intel_dp_init_source_oui). Returns the result of the read, or of the write.
+uint32_t XE::display13EDPIntelOUI(void *port) {
+ namespace L=Display13EDPLink;
+ uint8_t oui[L::SourceOUILength]={};
+ auto r=FunctionCast(wrapDisplay13ReadAUX,callbackXE->orgDisplay13ReadAUX)(port,L::SourceOUI,oui,sizeof(oui));
+ if(r || L::intelOUI(oui))return r;
+ uint8_t intel[L::SourceOUILength]={L::IntelOUI[0],L::IntelOUI[1],L::IntelOUI[2]};
+ r=FunctionCast(wrapDisplay13WriteAUX,callbackXE->orgDisplay13WriteAUX)(port,L::SourceOUI,intel,sizeof(intel));
+ ++display13EDPOUIWrites;display13EDPOUILast=r;
+ return r;
 }
 uint32_t XE::wrapDisplay13ReadAUX(void *port,uint32_t address,void *data,uint32_t length) {
  auto &c=display13FBPower;if(!c.lock)return kIOReturnNotReady;
@@ -7475,6 +7502,18 @@ uint32_t XE::wrapDisplay13ReadAUX(void *port,uint32_t address,void *data,uint32_
   if(display13EDPLink.assrHidden+display13EDPLink.intervalMasked+display13EDPLink.tps4Hidden!=before)display13EDPLinkPublish();
  }
  if(!r && complete && panel && display13EDPKeepActive())Display13EDPKeep::capLinkCaps(address,static_cast<uint8_t *>(data),length);
+ if(!r && complete && panel)L::level(display13EDPBacklight,address,static_cast<const uint8_t *>(data),length);
+ // The firmware's brightness over AUX, while the panel still has it: at the
+ // donor's first read of the receiver caps.
+ if(!r && complete && panel && address==L::ReceiverCaps && !display13EDPBacklight.known) {
+  uint8_t oui[L::SourceOUILength]={},caps[5]={},nits[2]={};
+  const auto read=FunctionCast(wrapDisplay13ReadAUX,callbackXE->orgDisplay13ReadAUX);
+  if(!read(port,L::SourceOUI,oui,sizeof(oui)) && !read(port,L::IntelCaps,caps,sizeof(caps)) &&
+     !read(port,L::IntelNits,nits,sizeof(nits)))
+   L::firmware(display13EDPBacklight,oui,caps,nits);
+  else display13EDPBacklight.known=true;
+  display13EDPBacklightPublish();
+ }
  return r ? r : complete ? 0 : kIOReturnNotReady;
 }
 uint32_t XE::wrapDisplay13WriteAUX(void *port,uint32_t address,void *data,uint32_t length) {
@@ -7513,9 +7552,15 @@ uint32_t XE::wrapDisplay13WriteAUX(void *port,uint32_t address,void *data,uint32
   display13EDPOrderLast[2]=r;display13EDPLinkPublish();
   return finish(r);
  }
- // Before the panel's link configuration, what Linux writes first: the
- // receiver in D0 (three tries 1 ms apart, as intel_dp_set_power) and 8b/10b.
+ // The donor's source identification: Intel's OUI stays on the panel instead.
+ if(panel && L::replacesOUI(display13EDPBacklight,address,length)) {
+  const auto r=display13EDPIntelOUI(port);++display13EDPOUIReplaced;display13EDPBacklightPublish();
+  return finish(r);
+ }
+ // Before the panel's link configuration, what Linux writes first: Intel's
+ // OUI, the receiver in D0 (three tries 1 ms apart, as intel_dp_set_power) and 8b/10b.
  if(panel && L::startsLinkConfig(address,bytes,length)) {
+  if(display13EDPBacklight.firmwareAux) {display13EDPIntelOUI(port);display13EDPBacklightPublish();}
   uint8_t power=L::PowerD0,coding=L::Coding8b10b;
   uint32_t powered=kIOReturnNotReady,tries=0;
   while(tries<3 && (powered=wrapDisplay13WriteAUX(port,L::SetPower,&power,1))) {++tries;IOSleep(1);}
@@ -7524,6 +7569,39 @@ uint32_t XE::wrapDisplay13WriteAUX(void *port,uint32_t address,void *data,uint32
   display13EDPLinkPublish();
  }
  return finish(send(address,data,length));
+}
+// After the panel trained: brightness over AUX back on and SDP override set,
+// as the GOP and Linux enable them, when the firmware had brightness over AUX
+// on (kern_display13_edp_link.hpp).
+void XE::display13EDPTrained(void *port) {
+ auto &c=display13FBPower;if(!c.lock)return;
+ namespace L=Display13EDPLink;
+ IOLockLock(c.lock);const bool ready=display13AUXReady(port,false);
+ const auto ddi=ready ? Display13FBMemory::field<uint32_t>(port,0x120) : UINT32_MAX;
+ const bool panel=ddi<2 && (callbackXE->adlnOutputWiring.panel&(1U<<ddi));IOLockUnlock(c.lock);
+ if(!panel || !display13EDPBacklight.firmwareAux)return;
+ auto *last=display13EDPBacklightLast;
+ // Intel's OUI, then the GOP's wait for the panel to offer the interface.
+ display13EDPIntelOUI(port);
+ uint8_t caps[3]={};uint32_t waited=0;
+ while(wrapDisplay13ReadAUX(port,L::IntelCaps,caps,sizeof(caps)) || !L::interface(caps)) {
+  if(waited>=L::CapsWaitMs) {last[5]=UINT32_MAX;display13EDPBacklightPublish();return;}
+  IOSleep(1);++waited;
+ }
+ last[5]=waited;
+ uint8_t control=0,nits[2]={};
+ if(wrapDisplay13ReadAUX(port,L::IntelControl,&control,1) || wrapDisplay13ReadAUX(port,L::IntelNits,nits,2)) {
+  display13EDPBacklightPublish();return;
+ }
+ const auto plan=L::restore(display13EDPBacklight,control,uint16_t(nits[0]|nits[1]<<8),caps[1]);
+ if(!plan.control) {display13EDPBacklightPublish();return;}
+ uint8_t level[4]={plan.nits[0],plan.nits[1],plan.nits[2],plan.nits[3]},value=plan.controlValue,readback=0;
+ uint32_t r=plan.level ? wrapDisplay13WriteAUX(port,L::IntelNits,level,sizeof(level)) : 0;
+ if(!r)r=wrapDisplay13WriteAUX(port,L::IntelControl,&value,1);
+ ++display13EDPBacklightRestores;
+ last[0]=control;last[1]=uint32_t(nits[0]|nits[1]<<8);last[2]=plan.level;last[3]=r;
+ last[4]=wrapDisplay13ReadAUX(port,L::IntelControl,&readback,1) ? UINT32_MAX : readback;
+ display13EDPBacklightPublish();
 }
 uint32_t XE::wrapDisplay13I2CAUX(void *port,uint32_t command,uint32_t *packet,uint32_t length,uint8_t flag) {
  auto &c=display13FBPower;if(!c.lock)return kIOReturnNotReady;
@@ -7676,7 +7754,9 @@ uint32_t XE::wrapDisplay13PortTraining(void *port,void *request) {
  const bool valid=p && p[0x115]==1 && !p[0x117] && p[0x10]<=1 && p[0x11A]<=1;
  if(valid)p[0x11A]&=p[0x10];
  IOLockUnlock(c.lock);if(!valid)return kIOReturnNotReady;
- return FunctionCast(wrapDisplay13PortTraining,s->orgDisplay13PortTraining)(port,request);
+ const auto r=FunctionCast(wrapDisplay13PortTraining,s->orgDisplay13PortTraining)(port,request);
+ if(!r)display13EDPTrained(port);
+ return r;
 }
 // Deferred native clock writes are per pipe and protected by the display
 // owner lock. The native port disable finishes them before PLL/DDI teardown.

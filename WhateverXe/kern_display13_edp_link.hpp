@@ -40,6 +40,30 @@
 // holds the donor's TRAINING_PATTERN_SET and sends it with the next
 // TRAINING_LANEx_SET, as Linux does. Any other access to the panel first
 // delivers the held write; a new TRAINING_PATTERN_SET replaces it.
+//
+// Brightness over AUX. The Intel TCON brightness interface (0x340-0x35F) is
+// Intel's: the panel offers it to a source that wrote Intel's OUI (00 aa 01)
+// to SOURCE_OUI (0x300). The GOP writes the OUI, waits until the panel
+// advertises the interface (0x340 version 1 or later, 0x341 bit 4 nits,
+// 0x342 bit 0 SDR brightness over AUX), turns it on (0x344 bit 4,
+// INTEL_EDP_HDR_TCON_BRIGHTNESS_AUX_ENABLE) and sets the level in nits at
+// 0x354. Linux writes the OUI before every SET_POWER D0 and does the rest when
+// it enables the backlight (intel_dp_init_source_oui,
+// intel_dp_aux_hdr_enable_backlight), and writes the OUI only when the panel
+// does not have it already, since writing it can clear the panel's state.
+// The donor writes Apple's source identification there and drives the PWM
+// only. A panel that lost power (a system sleep) comes back with 0x344 = 0,
+// ignores the level at 0x354 and stays dark.
+// When the firmware left the interface on under Intel's OUI, WEX keeps
+// Intel's OUI on the panel: before the link configuration, as Linux, and in
+// place of the donor's source identification. After the panel trains it waits
+// for the interface as the GOP and turns it back on; a level that came back 0
+// gets the last one read from the panel, or the firmware's.
+// Linux also sets SDP override (0x344 bit 7) when the panel offers SDP
+// colorimetry (0x341 bit 6) and the source has the gamut metadata DIP (Gen11
+// and later), and clears it otherwise (intel_dp_aux_fill_hdr_tcon_params).
+// WEX sets 0x344 after the panel trains as Linux does. The ATNA40CT01 offers
+// it and powers up with 0x344 = 0x90; the GOP leaves 0x10.
 #ifndef kern_display13_edp_link_hpp
 #define kern_display13_edp_link_hpp
 #include <stdint.h>
@@ -133,6 +157,55 @@ inline uint32_t join(uint8_t pattern,const uint8_t *lanes,uint32_t length,uint8_
 }
 // Clock recovery (TPS1) starts once the DDI buffer is active.
 inline bool clockRecovery(uint8_t pattern) {return (pattern&PatternMask)==PatternTPS1;}
+
+// Brightness over AUX.
+constexpr uint32_t SourceOUI=0x300, SourceOUILength=3, IntelCaps=0x340, IntelControl=0x344, IntelNits=0x354;
+constexpr uint8_t IntelOUI[SourceOUILength]={0x00,0xAA,0x01};
+constexpr uint8_t IntelNitsCap=0x10, IntelSdrAuxCap=0x01, IntelAuxEnable=0x10;
+constexpr uint8_t IntelSdpColorimetryCap=0x40, IntelSdpOverrideAux=0x80; // 0x341 bit 6, 0x344 bit 7
+constexpr uint32_t CapsWaitMs=200;  // The GOP's wait for the interface, 1 ms apart.
+struct Backlight {
+    bool known {};              // The firmware's state was read.
+    bool firmwareAux {};        // The firmware left brightness over AUX on, under Intel's OUI, with the caps for it.
+    bool firmwareOUI {};        // The firmware left Intel's OUI.
+    uint8_t firmwareControl {}; // 0x344 as the firmware left it.
+    uint16_t firmwareNits {};   // 0x354/0x355 as the firmware left it.
+    uint16_t lastNits {};       // The last level other than 0 read from the panel since.
+};
+inline bool intelOUI(const uint8_t *oui) {return oui && oui[0]==IntelOUI[0] && oui[1]==IntelOUI[1] && oui[2]==IntelOUI[2];}
+inline bool interface(const uint8_t *caps) {return caps[0]>=1 && (caps[1]&IntelNitsCap) && (caps[2]&IntelSdrAuxCap);}
+// The firmware's state: 0x300-0x302, 0x340-0x344 and 0x354-0x355 at the first reads of the panel.
+inline void firmware(Backlight &b,const uint8_t (&oui)[SourceOUILength],const uint8_t (&caps)[5],const uint8_t (&nits)[2]) {
+    b.known=true;b.firmwareOUI=intelOUI(oui);b.firmwareControl=caps[4];b.firmwareNits=uint16_t(nits[0]|nits[1]<<8);
+    b.firmwareAux=b.firmwareOUI && interface(caps) && (caps[4]&IntelAuxEnable);
+}
+// A completed read of the panel: the level it reports, while it has one.
+inline void level(Backlight &b,uint32_t address,const uint8_t *data,uint32_t length) {
+    if(!b.firmwareAux || !data || address>IntelNits || IntelNits+1-address>=length)return;
+    const uint16_t nits=uint16_t(data[IntelNits-address]|data[IntelNits+1-address]<<8);
+    if(nits)b.lastNits=nits;
+}
+// A donor write to the panel that covers SOURCE_OUI: kept off the panel while
+// WEX keeps Intel's OUI there.
+inline bool replacesOUI(const Backlight &b,uint32_t address,uint32_t length) {
+    return b.firmwareAux && length && address<SourceOUI+SourceOUILength && address+length>SourceOUI;
+}
+// After the panel trained, with 0x344, the level and 0x341 as the panel
+// reports them: the level to write first (Linux's four-byte write, delay and
+// steps 0), then 0x344 with brightness over AUX on and SDP override as Linux
+// sets it.
+struct Restore {bool level {};bool control {};uint8_t nits[4] {};uint8_t controlValue {};};
+inline Restore restore(const Backlight &b,uint8_t control,uint16_t nits,uint8_t caps1=0) {
+    Restore r;
+    if(!b.firmwareAux)return r;
+    uint8_t wanted=uint8_t((control|IntelAuxEnable)&~IntelSdpOverrideAux);
+    if(caps1&IntelSdpColorimetryCap)wanted|=IntelSdpOverrideAux;
+    if(wanted==control)return r;
+    r.control=true;r.controlValue=wanted;
+    const uint16_t level=b.lastNits ? b.lastNits : b.firmwareNits;
+    if(!(control&IntelAuxEnable) && !nits && level) {r.level=true;r.nits[0]=uint8_t(level);r.nits[1]=uint8_t(level>>8);}
+    return r;
+}
 
 // DDI_BUF_CTL: enabled, and idle until the buffer is active.
 constexpr uint32_t BufferEnable=1U<<31, BufferIdle=1U<<7, BufferWaitUs=10000, BufferPollUs=10;

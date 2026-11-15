@@ -140,6 +140,53 @@ int main() {
         }
         ++cases;
     }
+    // Brightness over AUX: the firmware's state, the level read since, the
+    // donor's source identification and what goes back after a power loss.
+    // The ATNA40CT01 at boot: Intel's OUI, version 1, nits, SDR over AUX, on.
+    {
+        const uint8_t intel[3]={0x00,0xaa,0x01},apple[3]={0x00,0x10,0xfa},on[5]={0x01,0x10,0x01,0x00,0x10},nits[2]={30,0};
+        Backlight b;firmware(b,intel,on,nits);
+        assert(b.known && b.firmwareAux && b.firmwareOUI && b.firmwareControl==0x10 && b.firmwareNits==30 && !b.lastNits);
+        auto r=restore(b,0x00,0);          // power lost: level 0, interface off
+        assert(r.control && r.controlValue==0x10 && r.level && r.nits[0]==30 && !r.nits[1] && !r.nits[2] && !r.nits[3]);
+        // Levels read from the panel: other than 0, where 0x354/0x355 is in the read.
+        const uint8_t span[4]={0x10,29,0,0},zero[2]={0,0},high[2]={0x90,0x01};
+        level(b,0x353,span,4);assert(b.lastNits==29);
+        level(b,IntelNits,zero,2);level(b,0x353,span,2);level(b,0x355,high,2);level(b,IntelNits,high,1);
+        assert(b.lastNits==29);
+        r=restore(b,0x00,0);assert(r.level && r.nits[0]==29 && !r.nits[1]);
+        level(b,IntelNits,high,2);r=restore(b,0x00,0);assert(r.nits[0]==0x90 && r.nits[1]==0x01);
+        r=restore(b,0x05,400);             // a level kept, other bits kept
+        assert(r.control && r.controlValue==0x15 && !r.level);
+        r=restore(b,0x10,0);               // still on: nothing
+        assert(!r.control && !r.level);
+        Backlight z;firmware(z,intel,on,zero);
+        r=restore(z,0,0);assert(r.control && !r.level);   // no level to give back
+        // The donor's writes that touch 0x300-0x302 are kept off the panel.
+        assert(replacesOUI(b,SourceOUI,12) && replacesOUI(b,0x302,1) && replacesOUI(b,0x2F0,0x11));
+        assert(!replacesOUI(b,0x303,9) && !replacesOUI(b,0x2F0,0x10) && !replacesOUI(b,SourceOUI,0));
+        assert(intelOUI(intel) && !intelOUI(apple) && !intelOUI(nullptr));
+        // Off unless the firmware had it on, under Intel's OUI, with the caps for it.
+        const uint8_t variants[][5]={{0x01,0x10,0x01,0x00,0x00},{0x00,0x10,0x01,0x00,0x10},
+                                     {0x01,0x00,0x01,0x00,0x10},{0x01,0x10,0x00,0x00,0x10}};
+        for(const auto &v:variants) {
+            Backlight o;firmware(o,intel,v,nits);
+            assert(o.known && !o.firmwareAux && !restore(o,0,0).control && !replacesOUI(o,SourceOUI,3));
+            level(o,IntelNits,nits,2);assert(!o.lastNits);
+        }
+        // SDP override as Linux: set when the panel offers SDP colorimetry
+        // (the ATNA40CT01's 0x341 = 0x77), cleared otherwise; the level only
+        // when brightness over AUX was off. The firmware's 0x10 becomes 0x90.
+        r=restore(b,0x10,400,0x77);assert(r.control && r.controlValue==0x90 && !r.level);
+        r=restore(b,0x90,400,0x77);assert(!r.control);
+        r=restore(b,0x00,0,0x77);assert(r.control && r.controlValue==0x90 && r.level);
+        r=restore(b,0x90,400,0x10);assert(r.control && r.controlValue==0x10 && !r.level);
+        assert(!restore(Backlight{},0x10,400,0x77).control);
+        Backlight a;firmware(a,apple,on,nits);
+        assert(!a.firmwareAux && !a.firmwareOUI && !restore(a,0,0).control && !replacesOUI(a,SourceOUI,3));
+        assert(!restore(Backlight{},0,0).control);
+        ++cases;
+    }
     printf("display13_edp_link: ok (%u cases)\n",cases);
     return 0;
 }

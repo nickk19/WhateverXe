@@ -3,9 +3,10 @@
 // (wrapDisplay13RegsNeedUpdate) over the panel path the IdeaPad Slim 5
 // 14IAH8's firmware lit, with the real boot readout, AUX bridge and owner
 // lock, mock MMIO and a sink with the panel's measured DPCD.
-struct Sink {uint8_t dpcd[0x2300] {};bool trained=false;unsigned statusReads=0;} sink;
+struct Sink {uint8_t dpcd[0x2300] {};bool trained=false;unsigned statusReads=0;uint32_t failingRead=UINT32_MAX;} sink;
 unsigned sinkRead(void *,uint32_t address,void *data,uint32_t length){
  assert(!locked);auto b=static_cast<uint8_t *>(data);
+ if(address==sink.failingRead)return 0xE00002BCU;
  if(address<=0x202 && address+length>0x202)++sink.statusReads;
  uint8_t status[6] {};if(sink.trained){status[0]=0x77;status[2]=0x01;}
  for(uint32_t i=0;i<length;++i){const auto a=address+i;b[i]=a>=0x202 && a<0x208 ? status[a-0x202] : sink.dpcd[a];}
@@ -31,6 +32,10 @@ void sinkReset(){
  const uint8_t rates[16]={0xa4,0x1f,0x30,0x2a,0x76,0x2f,0xbc,0x34,0x48,0x3f,0x60,0x54,0x78,0x69,0,0};
  memcpy(sink.dpcd+0x10,rates,16);sink.dpcd[0x700]=0x05;sink.dpcd[0x701]=0xfd;sink.dpcd[0x702]=0xff;sink.dpcd[0x703]=0x02;
  sink.dpcd[0x100]=0x14;sink.dpcd[0x101]=0x82;sink.dpcd[0x115]=3;sink.dpcd[0x10A]=0x80;sink.dpcd[0x600]=1;
+ // The Intel TCON brightness interface as the firmware leaves it: Intel's
+ // OUI, version 1, nits, SDR brightness over AUX, on; 30 nits.
+ const uint8_t intel[5]={0x01,0x10,0x01,0x00,0x10},oui[3]={0x00,0xaa,0x01};
+ memcpy(sink.dpcd+0x340,intel,5);memcpy(sink.dpcd+0x300,oui,3);sink.dpcd[0x354]=30;
 }
 void edpSetup(Fixture &f,Map &map,bool panel=true){
  setup(f,map,0,0,2,10,panel);auto &c=display13FBPower;state.display13FBAUXHooksReady=true;
@@ -42,6 +47,7 @@ void edpSetup(Fixture &f,Map &map,bool panel=true){
  map.regs[0x64000]=0x80;sinkReset();sinkWrites=SinkWrites{};display13EDPLink={};
  display13EDPOrder={};display13EDPOrderLast[0]=display13EDPOrderLast[1]=0;display13EDPOrderLast[2]=UINT32_MAX;
  testOnDelay()=nullptr;testDelayedUs()=0;
+ display13EDPBacklight={};display13EDPBacklightRestores=0;display13EDPOUIWrites=display13EDPOUIReplaced=0;
 }
 // getDPCDInfo and the link setup read the receiver caps, the extended caps,
 // the rate table and the LINK_BW_SET they reuse. Under -wex-edp-keep every view
@@ -123,6 +129,98 @@ void orderScenarios(unsigned &scenarios){
   ++scenarios;}
  sinkWrites=SinkWrites{};display13EDPOrder={};
 }
+// Brightness over AUX: the firmware's state read at the donor's first caps
+// read; Intel's OUI kept on the panel; after the panel trains, the interface
+// awaited and brightness over AUX back on when a power loss turned it off,
+// with the last level read from the panel, or the firmware's.
+void backlightScenarios(unsigned &scenarios){
+ const auto record=[](){auto &d=IORegistryEntry::getRegistryRoot()->data;auto i=d.find("WEXEDPBacklight");
+  std::vector<uint32_t> r;if(i!=d.end()){r.resize(i->second.size()/4);memcpy(r.data(),i->second.data(),r.size()*4);}return r;};
+ const auto boot=[](Fixture &f){uint8_t caps[16];assert(!XE::wrapDisplay13ReadAUX(f.port,0,caps,16));};
+ const auto powerLoss=[](){memset(sink.dpcd+0x300,0,3);sink.dpcd[0x344]=0;sink.dpcd[0x354]=sink.dpcd[0x355]=0;};
+ const LinkWrite intel{0x300,{0x00,0xaa,0x01}};
+ // The panel after a system sleep: Intel's OUI, then the level, then 0x344, as Linux.
+ {Fixture f(0,0,0);Map map;edpSetup(f,map);boot(f);
+  const auto &b=display13EDPBacklight;
+  assert(b.known && b.firmwareAux && b.firmwareOUI && b.firmwareNits==30 && !b.lastNits);
+  auto r=record();assert(r.size()==17 && r[0]==2 && r[1]==1 && r[2]==1 && r[3]==1 && r[4]==0x10 && r[5]==30 && !r[7]);
+  uint8_t again[16];sink.dpcd[0x344]=0;assert(!XE::wrapDisplay13ReadAUX(f.port,0,again,16) && b.firmwareControl==0x10);
+  sink.dpcd[0x344]=0x10;
+  // AuxDim's check of the level it wrote, through the donor: remembered.
+  uint8_t level[2];sink.dpcd[0x354]=29;assert(!XE::wrapDisplay13ReadAUX(f.port,0x354,level,2) && b.lastNits==29);
+  powerLoss();uint8_t zero[2];assert(!XE::wrapDisplay13ReadAUX(f.port,0x354,zero,2) && b.lastNits==29);
+  sinkWrites.allowed=true;const unsigned slept=testSleptMs();XE::display13EDPTrained(f.port);
+  assert((sinkWrites.log==std::vector<LinkWrite>{intel,{0x354,{29,0,0,0}},{0x344,{0x10}}}) && sink.dpcd[0x344]==0x10);
+  r=record();assert(r[7]==1 && !r[8] && !r[9] && r[10]==1 && !r[11] && r[12]==0x10 && !r[13] && r[14]==1 && !r[15]);
+  assert(testSleptMs()==slept);
+  // Trained again with the interface on: nothing to write.
+  XE::display13EDPTrained(f.port);assert(sinkWrites.log.size()==3 && record()[7]==1);
+  ++scenarios;}
+ // The firmware's level when none was read since; a level that came back
+ // stays; other bits of 0x344 stay.
+ {Fixture f(0,0,0);Map map;edpSetup(f,map);boot(f);
+  powerLoss();sinkWrites.allowed=true;XE::display13EDPTrained(f.port);
+  assert((sinkWrites.log==std::vector<LinkWrite>{intel,{0x354,{30,0,0,0}},{0x344,{0x10}}}));
+  powerLoss();sink.dpcd[0x344]=0x01;sink.dpcd[0x354]=0x90;sink.dpcd[0x355]=0x01;sinkWrites.log.clear();
+  XE::display13EDPTrained(f.port);
+  assert((sinkWrites.log==std::vector<LinkWrite>{intel,{0x344,{0x11}}}) && record()[9]==0x190 && !record()[10]);
+  ++scenarios;}
+ // The interface the panel does not offer within 200 ms, 1 ms apart: nothing
+ // more written. A failed level write leaves 0x344 alone.
+ {Fixture f(0,0,0);Map map;edpSetup(f,map);boot(f);
+  powerLoss();sink.dpcd[0x341]=0;sinkWrites.allowed=true;const unsigned slept=testSleptMs();
+  XE::display13EDPTrained(f.port);
+  assert((sinkWrites.log==std::vector<LinkWrite>{intel}) && testSleptMs()==slept+200 && record()[13]==UINT32_MAX && !record()[7]);
+  sink.dpcd[0x341]=0x10;sinkWrites.log.clear();sinkWrites.failing=0x354;XE::display13EDPTrained(f.port);
+  assert((sinkWrites.log==std::vector<LinkWrite>{{0x354,{30,0,0,0}}}) && !sink.dpcd[0x344] && record()[11]==0xE00002BCU);
+  ++scenarios;}
+ // The donor's source identification (Apple's OUI and device id) stays off
+ // the panel: Intel's OUI goes there only when the panel lost it. Intel's OUI
+ // also goes before the link configuration.
+ {Fixture f(0,0,0);Map map;edpSetup(f,map);boot(f);sinkWrites.allowed=true;
+  uint8_t apple[12]={0x00,0x10,0xfa,'A','A','P','L',0,0,1,1,0},bw[2]={0x0a,0x82};
+  assert(!XE::wrapDisplay13WriteAUX(f.port,0x300,apple,12) && sinkWrites.log.empty());
+  powerLoss();assert(!XE::wrapDisplay13WriteAUX(f.port,0x300,apple,12));
+  assert((sinkWrites.log==std::vector<LinkWrite>{intel}) && !memcmp(sink.dpcd+0x300,"\x00\xaa\x01\x00",4));
+  assert(!XE::wrapDisplay13WriteAUX(f.port,0x302,apple,2) && sinkWrites.log.size()==1);  // overlaps the OUI
+  assert(!XE::wrapDisplay13WriteAUX(f.port,0x303,apple,2) && sinkWrites.log.size()==2);  // after it: the donor's
+  powerLoss();sinkWrites.log.clear();assert(!XE::wrapDisplay13WriteAUX(f.port,0x100,bw,2));
+  assert(sinkWrites.log.size()==4 && sinkWrites.log[0]==intel && sinkWrites.log[1].first==0x600 && sinkWrites.log[3].first==0x100);
+  auto r=record();assert(r[14]==2 && !r[15] && r[16]==3);
+  ++scenarios;}
+ // Brightness the firmware did not put over AUX, under Intel's OUI, a panel
+ // without the interface, an unreadable interface: never written, the
+ // donor's source identification passes.
+ for(unsigned c=0;c<4;++c) {
+  Fixture f(0,0,0);Map map;edpSetup(f,map);
+  if(c==0)sink.dpcd[0x344]=0;
+  if(c==1)sink.dpcd[0x342]=0;
+  if(c==2)sink.failingRead=0x340;
+  if(c==3)sink.dpcd[0x301]=0x10;
+  boot(f);assert(display13EDPBacklight.known && !display13EDPBacklight.firmwareAux);
+  sink.failingRead=UINT32_MAX;powerLoss();sinkWrites.allowed=true;XE::display13EDPTrained(f.port);
+  assert(sinkWrites.log.empty() && !record()[7]);
+  uint8_t apple[3]={0x00,0x10,0xfa};assert(!XE::wrapDisplay13WriteAUX(f.port,0x300,apple,3) && sinkWrites.log.size()==1);
+ }
+ ++scenarios;
+ // The ATNA40CT01's caps (0x341 = 0x77, SDP colorimetry): after the donor
+ // trains the firmware-lit panel, 0x344 goes from the firmware's 0x10 to
+ // Linux's 0x90, the level stays; after a power loss the level, then 0x90.
+ {Fixture f(0,0,0);Map map;edpSetup(f,map);sink.dpcd[0x341]=0x77;sink.dpcd[0x354]=0x90;sink.dpcd[0x355]=0x01;boot(f);
+  sinkWrites.allowed=true;XE::display13EDPTrained(f.port);
+  assert((sinkWrites.log==std::vector<LinkWrite>{{0x344,{0x90}}}) && sink.dpcd[0x344]==0x90);
+  auto r=record();assert(r[7]==1 && r[8]==0x10 && r[9]==0x190 && !r[10] && !r[11] && r[12]==0x90);
+  XE::display13EDPTrained(f.port);assert(sinkWrites.log.size()==1);
+  powerLoss();sinkWrites.log.clear();XE::display13EDPTrained(f.port);
+  assert((sinkWrites.log==std::vector<LinkWrite>{intel,{0x354,{0x90,0x01,0,0}},{0x344,{0x90}}}));
+  ++scenarios;}
+ // Another port: neither read at boot nor written.
+ {Fixture f(0,0,0);Map map;edpSetup(f,map,false);boot(f);
+  assert(!display13EDPBacklight.known);powerLoss();sinkWrites.allowed=true;
+  XE::display13EDPTrained(f.port);assert(sinkWrites.log.empty());
+  ++scenarios;}
+ sinkWrites=SinkWrites{};
+}
 // The panel's link training as the firmware and Linux run it
 // (kern_display13_edp_link.hpp): the donor's reads of the receiver caps, its
 // link configuration writes and the order of its training pattern writes.
@@ -199,8 +297,9 @@ void linkScenarios(){
   assert((sinkWrites.log==std::vector<LinkWrite>{{0x100,{0x0A,0x82}},{0x102,{0x21}},{0x103,{0,0,0,0}}}) && !display13EDPOrder.holds);
   ++scenarios;}
  orderScenarios(scenarios);
+ backlightScenarios(scenarios);
  sinkWrites=SinkWrites{};display13EDPLink={};
- printf("PASS Display13 eDP link: interval 0, no ASSR and TPS3 in the donor's caps view, D0 and 8b/10b before the link configuration, training patterns after the source (%u scenarios)\n",scenarios);
+ printf("PASS Display13 eDP link: interval 0, no ASSR and TPS3 in the donor's caps view, D0 and 8b/10b before the link configuration, training patterns after the source, Intel's OUI on the panel and brightness over AUX back on after training (%u scenarios)\n",scenarios);
 }
 // The panel path the firmware lit: pipe A -> DDI A eDP SST x2, 8 bpc,
 // 1920x1200 from the panel's EDID DTD (154.25 MHz, 1920+160 x 1200+36, sync

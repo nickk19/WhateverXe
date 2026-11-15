@@ -10,7 +10,7 @@ functions='\n'.join(re.search(re.escape(sig)+r'.*?\n\}',s,re.S).group() for sig 
  'uint8_t *XE::display13SSTPort(', 'uint8_t *XE::display13PanelBootPort(', 'bool XE::display13HDMIPort(', 'bool XE::display13MainLinkAUX(',
  'uint32_t XE::wrapDisplay13EnablePort(', 'uint32_t XE::wrapDisplay13DisablePort(',
  'uint32_t XE::wrapDisplay13SignalLevels(', 'uint32_t XE::wrapDisplay13TrainingPattern(',
- 'bool XE::display13AUXReady(', 'uint32_t XE::wrapDisplay13ReadAUX(', 'uint32_t XE::wrapDisplay13WriteAUX(',
+ 'bool XE::display13AUXReady(', 'uint32_t XE::wrapDisplay13ReadAUX(', 'uint32_t XE::wrapDisplay13WriteAUX(', 'void XE::display13EDPTrained(',
  'bool XE::wrapDisplay13RegsNeedUpdate(',
  'bool XE::display13EDPBlankReady(', 'void XE::display13EDPBlankPublishReady(', 'bool XE::display13EDPBlankPower('])
 binding=re.search(r'static TGLFBBinding::Readout adlnInspectPathBinding\(.*?\n\}',s,re.S).group()
