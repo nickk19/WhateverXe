@@ -45,5 +45,34 @@ struct OnGate {
   if(ok)changed=false;return ok;
  }
 };
+// A panel the firmware lit is still on at the donor's first panel-on request,
+// and hwSetPanelPower(2) returns without a PPS write when PP_STATUS reads on:
+// the donor's complete mode set then trains a panel that went through no power
+// cycle since the firmware's link. Samsung ATNA OLED eDP panels stay dark that
+// way (training completes, brightness over AUX is ignored) until a display
+// sleep powers them off and its wake on again. Linux's full mode set powers
+// the panel off on disable and on again on enable (intel_pps_off/on, with the
+// power cycle delay T12 between them). Do the same once for such a panel,
+// through the donor: off (0), then on (2). Not with -wex-edp-keep, whose kept
+// link runs on the firmware's panel power.
+struct Cycle {
+ static constexpr uint32_t Off=0,On=2,PPStatus=0xC7200,PPOn=0x80000000U;
+ bool donorOn {}; // The panel is on by the donor's own latest request.
+ uint32_t requests {},cycles {};
+ // The latest on request: -wex-edp-keep, donorOn, PP_STATUS before, the off
+ // result, PP_STATUS after off, the on result, PP_STATUS after on, then the
+ // microseconds off and on took (UINT32_MAX / 0 when nothing was cycled).
+ uint32_t last[9] {};
+ bool wanted(uint32_t state,uint32_t status,bool keep) const {
+  return state==On && !keep && !donorOn && status!=~0U && (status&PPOn);
+ }
+ void begin(uint32_t status,bool keep) {
+  ++requests;const uint32_t start[9]={keep,donorOn,status,~0U,~0U,~0U,~0U,0,0};
+  for(unsigned i=0;i<9;++i)last[i]=start[i];
+ }
+ // Every request the wrapper took, failed ones too: only a completed on
+ // leaves the panel on by the donor.
+ void finish(uint32_t state,bool ok) {donorOn=ok && state==On;}
+};
 }
 #endif

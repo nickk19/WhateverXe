@@ -35,7 +35,7 @@ See [tested features and known issues](#tested-features-and-known-issues) for OS
 - Other supported Alder Lake-N / Twin Lake configurations.
 - Other supported Alder Lake-H/P/U and Raptor Lake-H/P/U configurations.
 - Other supported Alder Lake-S/HX and Raptor Lake-S/HX configurations.
-- Internal eDP on Alder Lake-N / Twin Lake and Alder Lake-H/P/U / Raptor Lake-H/P/U is implemented; on hardware it has been tested only with the firmware's panel link kept (`-wex-edp-keep`, see [other settings](#other-settings)).
+- Internal eDP on Alder Lake-N / Twin Lake, and on Alder Lake-H/P/U / Raptor Lake-H/P/U panels other than the tested OLED panel (see [tested features and known issues](#tested-features-and-known-issues)).
 
 ### Further implementation required
 
@@ -97,7 +97,7 @@ The common regression checks cover Metal, OpenGL, OpenCL, hardware H.264 encode/
 | Alder Lake-N / Twin Lake laptops | MicroPC 2 and MiniBook X N100 on Big Sur/Tahoe: MIPI DSI, brightness, rotation, display off/on and HDMI/USB-C coexistence. MicroPC 2: HiDPI and up to three displays; MiniBook X N100: optional 60 Hz |
 | Raptor Lake-U laptop | MiniBook X U300 on Big Sur/Tahoe: internal MIPI DSI, brightness, rotation, HiDPI and up to two USB-C displays. Internal panel: 50 Hz; optional 60 Hz also tested on Big Sur |
 | Alder Lake-H | Big Sur–Tahoe: 96 EU, three displays using HDMI and a DP-to-HDMI adapter. Single-channel `4626` graphics acceleration checked on Big Sur |
-| Alder Lake-H laptops | Tahoe: 48 EU, internal 1920x1200 OLED eDP with `-wex-edp-keep`, including scaled resolutions. Display sleep as a black screen with `-wex-edp-blank`; OLED brightness is unsupported |
+| Alder Lake-H laptops | Tahoe: 48 EU, internal 1920x1200 OLED eDP and display sleep. With `-wex-edp-keep` also scaled resolutions, and display sleep as a black screen with `-wex-edp-blank`. OLED brightness is unsupported |
 | Alder Lake-S | Big Sur–Tahoe: UHD 770, HDMI/DP/USB-C and up to three displays; Safari video, with Widevine checked on Big Sur/Tahoe |
 
 MIPI DSI support is **experimental**, limited to the tested GPD MicroPC 2 and CHUWI MiniBook X N100/U300 panels. Do not expect it to work on other devices.

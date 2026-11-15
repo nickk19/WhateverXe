@@ -35,7 +35,7 @@ OS別の範囲と表示構成は[動作確認済みの機能と既知の問題](
 - 対応IDの他のAlder Lake-N / Twin Lake構成。
 - 対応IDの他のAlder Lake-H/P/U・Raptor Lake-H/P/U構成。
 - 対応IDの他のAlder Lake-S/HX・Raptor Lake-S/HX構成。
-- Alder Lake-N / Twin LakeとAlder Lake-H/P/U / Raptor Lake-H/P/Uの内蔵eDPは実装済みです。実機ではファームウェアのパネルリンクを維持する設定（`-wex-edp-keep`、[その他の設定](#その他の設定)を参照）でのみ確認しています。
+- Alder Lake-N / Twin Lakeの内蔵eDP、および確認済みの有機ELパネル以外のAlder Lake-H/P/U / Raptor Lake-H/P/Uの内蔵eDP（[動作確認済みの機能と既知の問題](#動作確認済みの機能と既知の問題)を参照）。
 
 ### 対応に追加改修が必要
 
@@ -97,7 +97,7 @@ BIOS/UEFIで設定できる場合は、**DVMT Pre-Allocatedを96MB**にします
 | Alder Lake-N / Twin Lakeラップトップ | Big Sur・Tahoe：MicroPC 2・MiniBook X N100のMIPI DSI・輝度・回転・消灯復帰・HDMI/USB-C共存。MicroPC 2はHiDPI・最大3画面、MiniBook X N100は任意設定の60 Hzも確認 |
 | Raptor Lake-Uラップトップ | Big Sur・Tahoe：MiniBook X U300の内蔵MIPI DSI・輝度・回転・HiDPI・USB-C外部2画面。内蔵は50 Hz、Big Surでは任意設定の60 Hzも確認 |
 | Alder Lake-H | Big Sur〜Tahoe：96 EU、HDMIとDP→HDMI変換器による3画面。シングルチャネル構成の`4626`でもBig Surの加速を確認 |
-| Alder Lake-Hラップトップ | Tahoe：48 EU、`-wex-edp-keep`による1920x1200有機ELの内蔵eDP（スケーリングした解像度を含む）。`-wex-edp-blank`で黒画面によるディスプレイのスリープに対応。有機ELの輝度調整は未対応 |
+| Alder Lake-Hラップトップ | Tahoe：48 EU、1920x1200有機ELの内蔵eDPとディスプレイのスリープ。`-wex-edp-keep`ではスケーリングした解像度にも対応し、`-wex-edp-blank`で黒画面によるディスプレイのスリープに対応。有機ELの輝度調整は未対応 |
 | Alder Lake-S | Big Sur〜Tahoe：UHD 770、HDMI/DP/USB-C、最大3画面、Safari動画。WidevineはBig Sur/Tahoeで確認 |
 
 MIPI DSI対応は**試験的**で、検証したGPD MicroPC 2・CHUWI MiniBook X N100/U300の内蔵パネルに限ります。他の機器での動作を期待しないでください。

@@ -65,5 +65,16 @@ int main() {
   assert(io.writes.size()==(initial?0U:2U));
  }
  IO io;io.r[0xC2020]=~0U;Display13Panel::OnGate gate;assert(!gate.begin(io) && gate.finish(io) && io.writes.empty());
- puts("PASS Display13 panel topology/probe/PPS0 qualification, PWM preservation/fallback, WA cleanup");
+ // Only an on request for a panel lit by someone else is power cycled.
+ Display13Panel::Cycle cycle;
+ assert(cycle.wanted(2,0x80000008,false) && !cycle.wanted(0,0x80000008,false) && !cycle.wanted(1,0x80000008,false));
+ assert(!cycle.wanted(2,0x80000008,true) && !cycle.wanted(2,8,false) && !cycle.wanted(2,~0U,false));
+ cycle.finish(2,true);assert(cycle.donorOn && !cycle.wanted(2,0x80000008,false));
+ cycle.finish(0,true);assert(!cycle.donorOn && cycle.wanted(2,0x80000008,false));
+ cycle.finish(2,true);cycle.finish(2,false);assert(!cycle.donorOn);
+ cycle.begin(0x80000008,true);
+ assert(cycle.requests==1 && !cycle.cycles && cycle.last[0]==1 && !cycle.last[1] && cycle.last[2]==0x80000008);
+ for(unsigned i=3;i<7;++i)assert(cycle.last[i]==~0U);
+ assert(!cycle.last[7] && !cycle.last[8]);
+ puts("PASS Display13 panel topology/probe/PPS0 qualification, PWM preservation/fallback, WA cleanup, firmware panel power cycle");
 }

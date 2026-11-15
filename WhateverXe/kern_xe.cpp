@@ -4698,6 +4698,7 @@ struct Display13FBPowerContext {
     bool tcSignalReady[4] {};
     IOLock *panelLock {};
     Display13Panel::State panel;
+    Display13Panel::Cycle panelCycle; // Under panelLock.
     bool panelFaulted {};
     bool bootPanel {};
     bool bootDP {}; // Board protocol captured with the protected boot reference.
@@ -6763,7 +6764,7 @@ bool XE::wrapAlderLakeNGetOSInformation(IOService *controller) {
 	memcpy(reinterpret_cast<uint8_t *>(controller)+0xB48,&dcPolicy[1],sizeof(uint32_t));
 	s->adlnTopologyController=controller;
  s->tglObservationController=controller;
- display13FBPower.panel={};display13FBPower.panelFaulted=false;resetPanelDepth();
+ display13FBPower.panel={};display13FBPower.panelCycle={};display13FBPower.panelFaulted=false;resetPanelDepth();
 	controller->setProperty("N97FBConnectorPolicy",copy+0x20,24*Display13FBTopology::Ports);
 	controller->setProperty("N97FBDMCPolicy",dcPolicy,sizeof(dcPolicy));
 	return true;
@@ -14002,26 +14003,58 @@ void XE::display13PanelPWMEnable(void *access) {
  }
  IOLockUnlock(c.lock);
 }
+// WEXEDPPanelCycle (Display13Panel::Cycle), at every panel-on request: version 1,
+// on requests, power cycles, then for the latest request -wex-edp-keep, panel
+// on by the donor, PP_STATUS before, off result, PP_STATUS after off, on
+// result, PP_STATUS after on, microseconds off and on took.
+static void display13PanelCyclePublish(const Display13Panel::Cycle &cycle) {
+ uint32_t record[12]={1,cycle.requests,cycle.cycles};memcpy(record+3,cycle.last,sizeof(cycle.last));
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPPanelCycle",record,sizeof(record));
+}
+static uint32_t display13PanelElapsedUs(uint64_t since) {
+ uint64_t now=0,ns=0;clock_get_uptime(&now);absolutetime_to_nanoseconds(now-since,&ns);
+ return ns/1000>UINT32_MAX ? UINT32_MAX : uint32_t(ns/1000);
+}
 uint32_t XE::wrapDisplay13PanelPower(void *controller,uint32_t state) {
- auto s=callbackXE;auto &c=display13FBPower;
- if(!s->adlnOutputWiring.panel)return FunctionCast(wrapDisplay13PanelPower,s->orgDisplay13PanelPower)(controller,state);
+ auto s=callbackXE;auto &c=display13FBPower;using Cycle=Display13Panel::Cycle;
+ const auto native=FunctionCast(wrapDisplay13PanelPower,s->orgDisplay13PanelPower);
+ if(!s->adlnOutputWiring.panel)return native(controller,state);
  if(!c.panelLock || !c.lock || !display13PanelCapture(controller))return kIOReturnNotReady;
+ const bool keep=state==Cycle::On && display13EDPKeepActive();
  IOLockLock(c.panelLock);IOLockLock(c.lock);Display13FBPanelIO io{c.map};Display13Panel::OnGate gate;
+ auto &cycle=c.panelCycle;
  const bool owned=display13PanelTarget(controller) && display13PanelPowerReference(true);
- const bool ready=owned && (state!=2 || gate.begin(io));
+ const bool ready=owned && (state!=Cycle::On || gate.begin(io));
+ const auto before=owned?io.read(Cycle::PPStatus):UINT32_MAX;
+ const bool cycled=ready && cycle.wanted(state,before,keep);
+ if(state==Cycle::On)cycle.begin(before,keep);
  IOLockUnlock(c.lock);
- const auto result=ready?FunctionCast(wrapDisplay13PanelPower,s->orgDisplay13PanelPower)(controller,state):uint32_t(kIOReturnNotReady);
+ uint32_t result=kIOReturnNotReady;
+ if(cycled) {
+  // The firmware's panel (Display13Panel::Cycle): the donor waits for it to
+  // go off, then for the power cycle delay, then for it to come on.
+  uint64_t start=0;clock_get_uptime(&start);
+  cycle.last[3]=native(controller,Cycle::Off);
+  IOLockLock(c.lock);cycle.last[4]=io.read(Cycle::PPStatus);IOLockUnlock(c.lock);
+  cycle.last[7]=display13PanelElapsedUs(start);clock_get_uptime(&start);
+  result=cycle.last[5]=native(controller,state);
+  cycle.last[8]=display13PanelElapsedUs(start);++cycle.cycles;
+ }
+ else if(ready)result=native(controller,state);
  IOLockLock(c.lock);
  // Always restore the workaround before releasing our PG, also after failed on.
  const bool restored=!owned || gate.finish(io);
  bool ok=ready && restored;
  if(owned) {
-  const auto status=io.read(0xC7200);
-  ok=ok && status!=UINT32_MAX && (state==2 ? (status&0x80000000U)!=0 : !(status&0x80000000U));
+  const auto status=io.read(Cycle::PPStatus);
+  if(state==Cycle::On)cycle.last[6]=status;
+  ok=ok && status!=UINT32_MAX && (state==Cycle::On ? (status&Cycle::PPOn)!=0 : !(status&Cycle::PPOn));
   ok=display13PanelPowerReference(false) && ok;
  }
  if(!ok)c.panelFaulted=true;
+ cycle.finish(state,ok);const auto published=cycle;
  IOLockUnlock(c.lock);IOLockUnlock(c.panelLock);
+ if(state==Cycle::On)display13PanelCyclePublish(published);
  return ok?result:uint32_t(kIOReturnNotReady);
 }
 

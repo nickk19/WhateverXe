@@ -25,12 +25,19 @@ bool display13TCHealthyAUX(IOMemoryMap*,unsigned){assert(false);return false;}
 // PRODUCTION_IO
 struct Context {
  IOMemoryMap *map=nullptr;void *controller=nullptr,*power=nullptr,*access=nullptr;
- Lock *lock=nullptr,*panelLock=nullptr;Display13Power::NativeBridge bridge;Display13Panel::State panel;
+ Lock *lock=nullptr,*panelLock=nullptr;Display13Power::NativeBridge bridge;Display13Panel::State panel;Display13Panel::Cycle panelCycle;
  bool clockStopped=false,clockFaulted=false,panelFaulted=false;
 }display13FBPower;
 bool mapping=true;bool adlnWriterMappingBound(){return mapping;}
 constexpr uint32_t kIOReturnNotReady=0xe00002d8;
 #define FunctionCast(f,p) reinterpret_cast<decltype(&f)>(p)
+uint64_t clockNow=0;
+void clock_get_uptime(uint64_t *t){*t=clockNow;}
+// The production record and clock helpers; the published records are kept.
+std::vector<Display13Panel::Cycle> published;
+void display13PanelCyclePublish(const Display13Panel::Cycle &cycle){published.push_back(cycle);}
+uint32_t display13PanelElapsedUs(uint64_t since){return uint32_t(clockNow-since);}
+bool keepActive=false;
 struct XE {
  static XE *callbackXE;
  bool display13FramebufferRequested=true,display13PanelPowerReady=true;
@@ -41,16 +48,18 @@ struct XE {
  static bool display13PanelCapture(void*);static void display13PanelTiming(void*,bool);
  static uint32_t display13PanelBrightness(void*,uint32_t);static void display13PanelPWMEnable(void*);
  static uint32_t wrapDisplay13PanelPower(void*,uint32_t);
+ static bool display13EDPKeepActive(){return keepActive;}
 };XE *XE::callbackXE;
 // METHODS
-unsigned calls=0;bool timeout=false;uint32_t nativeResult=0;
+unsigned calls=0;bool timeout=false;uint32_t nativeResult=0,stuck=~0U;std::vector<uint32_t> states;
 uint32_t nativePower(void *controller,uint32_t state) {
  auto &c=display13FBPower;assert(controller==c.controller && !c.lock->held && c.panelLock->held);++calls;
+ states.push_back(state);clockNow+=state==2?300:100;
  assert(c.bridge.nativeRefs(1)==2 && Display13FBMemory::field<unsigned>(c.power,0x20)==2);
  if(state==2)assert(c.map->at(0xC2020)&(1U<<29));
  // Native config invokes the property callback, then proceeds with sequencing.
  XE::display13PanelTiming(controller,true);
- if(!timeout)c.map->at(0xC7200)=state==2?0x80000000:0;
+ if(!timeout && state!=stuck)c.map->at(0xC7200)=state==2?0x80000000:0;
  c.map->at(0xC2020)|=0x10000;return nativeResult;
 }
 template<class T>void put(void *p,unsigned o,T v){memcpy(static_cast<uint8_t*>(p)+o,&v,sizeof(v));}
@@ -68,7 +77,7 @@ struct Fixture {
   map.at(0xC8250)=0xa0000000;map.at(0xC8254)=120000;map.at(0xC8258)=60000;map.at(0xC2020)=0x1234;
   Display13FBPanelIO io{&map};assert(c.bridge.begin(io,0,1).status==Display13Power::Status::Complete);
   assert(Display13Power::publishObject(c.bridge,power,sizeof(power),ctl,sizeof(ctl)));
-  calls=0;timeout=false;nativeResult=0;mapping=true;
+  calls=0;timeout=false;nativeResult=0;stuck=~0U;mapping=true;states.clear();published.clear();keepActive=false;
  }
  void balanced(){auto &c=display13FBPower;assert(c.bridge.nativeRefs(1)==1 && Display13FBMemory::field<unsigned>(power,0x20)==1 && !owner.held && !pps.held);}
 };
@@ -92,6 +101,41 @@ int main(int argc,char **argv) {
   f.balanced();assert(calls==1 && f.map.at(0xC2020)==(0x11234|(gate?1U<<29:0)));
   assert(display13FBPower.panelFaulted==fail);
   if(!fail){assert(!XE::wrapDisplay13PanelPower(f.ctl,0));f.balanced();assert(!f.map.at(0xC7200));}
+ }
+ // The firmware's lit panel: one power cycle (off, then on) at the donor's
+ // first on request; none once the donor powered it on, with the panel off,
+ // or with -wex-edp-keep. Off requests publish nothing.
+ {
+  Fixture f;auto &c=display13FBPower;f.map.at(0xC7200)=0x80000000;
+  assert(!XE::wrapDisplay13PanelPower(f.ctl,2));f.balanced();
+  assert((states==std::vector<uint32_t>{0,2}) && f.map.at(0xC2020)==0x11234 && !c.panelFaulted && c.panelCycle.donorOn);
+  assert(published.size()==1 && published[0].requests==1 && published[0].cycles==1);
+  const uint32_t first[9]={0,0,0x80000000,0,0,0,0x80000000,100,300};assert(!memcmp(published[0].last,first,sizeof(first)));
+  assert(!XE::wrapDisplay13PanelPower(f.ctl,2));f.balanced();
+  assert((states==std::vector<uint32_t>{0,2,2}) && published.size()==2 && published[1].requests==2 && published[1].cycles==1);
+  const uint32_t again[9]={0,1,0x80000000,~0U,~0U,~0U,0x80000000,0,0};assert(!memcmp(published[1].last,again,sizeof(again)));
+  assert(!XE::wrapDisplay13PanelPower(f.ctl,0));f.balanced();
+  assert(published.size()==2 && !c.panelCycle.donorOn && !f.map.at(0xC7200));
+  assert(!XE::wrapDisplay13PanelPower(f.ctl,2));f.balanced();
+  assert((states==std::vector<uint32_t>{0,2,2,0,2}) && published.size()==3 && published[2].cycles==1 && published[2].last[2]==0);
+ }
+ for(bool keep:{false,true}) {
+  // Keep: the kept link runs on the firmware's panel power. Not lit: nothing to cycle.
+  Fixture f;keepActive=keep;f.map.at(0xC7200)=keep?0x80000000:0;
+  assert(!XE::wrapDisplay13PanelPower(f.ctl,2));f.balanced();
+  assert((states==std::vector<uint32_t>{2}) && published.size()==1 && !published[0].cycles && published[0].last[0]==keep);
+  assert(display13FBPower.panelCycle.donorOn && !display13FBPower.panelFaulted);
+ }
+ {
+  // An off the panel ignores leaves the donor's on a no-op: recorded, not a failure.
+  Fixture f;f.map.at(0xC7200)=0x80000000;stuck=0;
+  assert(!XE::wrapDisplay13PanelPower(f.ctl,2));f.balanced();
+  assert((states==std::vector<uint32_t>{0,2}) && published[0].cycles==1 && published[0].last[4]==0x80000000);
+  // A panel that does not come back on fails the request like any on.
+  Fixture g;g.map.at(0xC7200)=0x80000000;stuck=2;
+  assert(XE::wrapDisplay13PanelPower(g.ctl,2)==kIOReturnNotReady);g.balanced();
+  assert((states==std::vector<uint32_t>{0,2}) && display13FBPower.panelFaulted && !display13FBPower.panelCycle.donorOn);
+  assert(g.map.at(0xC2020)==0x11234 && published.size()==1 && !published[0].last[4] && !published[0].last[6]);
  }
  for(unsigned bad=0;bad<10;++bad) {
   Fixture f;auto &c=display13FBPower;
@@ -139,5 +183,5 @@ int main(int argc,char **argv) {
   munmap(image,0x400000);
   puts("PASS exact native LightUpEDP power/train failure exits; original donor counterexamples");
  }
- puts("PASS production Display13 PPS/PWM wrappers: unlocked native calls, balanced/published PG, on/off/failure cleanup, foreign owner rejection");
+ puts("PASS production Display13 PPS/PWM wrappers: unlocked native calls, balanced/published PG, on/off/failure cleanup, firmware panel power cycle, foreign owner rejection");
 }
