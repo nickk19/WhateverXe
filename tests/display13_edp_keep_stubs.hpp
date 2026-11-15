@@ -1,4 +1,4 @@
-// Kernel imports of kern_xe.cpp's -wex-edp-keep code for the extracted
+// Kernel imports of kern_xe.cpp's -wex-edp-keep and eDP link code for the extracted
 // Display13 AUX/SST wrapper fixtures. Boot arguments are test-controlled and
 // registry properties keep their bytes.
 #ifndef DISPLAY13_EDP_KEEP_STUBS_HPP
@@ -11,6 +11,7 @@
 #include <string>
 #include <vector>
 #include "kern_display13_edp_keep.hpp"
+#include "kern_display13_edp_link.hpp"
 inline std::set<std::string> &testKernelArguments() {static std::set<std::string> a;return a;}
 inline bool checkKernelArgument(const char *name) {return testKernelArguments().count(name)!=0;}
 struct TestRegistryRoot {
@@ -27,4 +28,12 @@ inline std::vector<std::string> &testSyslog() {static std::vector<std::string> l
 #define SYSLOG(module,fmt,...) testSyslog().push_back(fmt)
 #endif
 template<class T,size_t N> constexpr size_t arrsize(const T (&)[N]) {return N;}
+// The eDP link's SET_POWER retries sleep 1 ms apart; the fixtures count it.
+inline unsigned &testSleptMs() {static unsigned ms=0;return ms;}
+inline void IOSleep(unsigned ms) {testSleptMs()+=ms;}
+// The DDI buffer wait polls 10 us apart; the fixtures count it and can let
+// the buffer leave idle after some time.
+inline unsigned &testDelayedUs() {static unsigned us=0;return us;}
+inline void (*&testOnDelay())(unsigned) {static void (*hook)(unsigned)=nullptr;return hook;}
+inline void IODelay(unsigned us) {testDelayedUs()+=us;if(testOnDelay())testOnDelay()(testDelayedUs());}
 #endif

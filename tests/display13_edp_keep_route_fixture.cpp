@@ -11,8 +11,16 @@ unsigned sinkRead(void *,uint32_t address,void *data,uint32_t length){
  for(uint32_t i=0;i<length;++i){const auto a=address+i;b[i]=a>=0x202 && a<0x208 ? status[a-0x202] : sink.dpcd[a];}
  return 0;
 }
-// Neither the caps view nor the decision writes to the sink.
-unsigned sinkWrite(void *,uint32_t,void *,uint32_t){assert(false);return 0;}
+// Neither the caps view nor the decision writes to the sink; the link
+// configuration scenarios let it, and can make one register fail.
+struct SinkWrites {bool allowed=false;uint32_t failing=UINT32_MAX;std::vector<std::pair<uint32_t,std::vector<uint8_t>>> log;} sinkWrites;
+unsigned sinkWrite(void *,uint32_t address,void *data,uint32_t length){
+ assert(!locked && sinkWrites.allowed);auto b=static_cast<uint8_t *>(data);
+ sinkWrites.log.push_back({address,std::vector<uint8_t>(b,b+length)});
+ if(address==sinkWrites.failing)return 0xE00002BCU;
+ for(uint32_t i=0;i<length;++i)sink.dpcd[address+i]=b[i];
+ return 0;
+}
 // Samsung ATNA40CT01 (WEXEDPDPCD and the Linux i915 DPCD dump): receiver caps,
 // SUPPORTED_LINK_RATES up to 5.4 Gbps, eDP 1.4b, and the link settings the
 // firmware leaves: LINK_BW_SET 0x14 next to LINK_RATE_SET 3, two lanes with
@@ -24,18 +32,22 @@ void sinkReset(){
  memcpy(sink.dpcd+0x10,rates,16);sink.dpcd[0x700]=0x05;sink.dpcd[0x701]=0xfd;sink.dpcd[0x702]=0xff;sink.dpcd[0x703]=0x02;
  sink.dpcd[0x100]=0x14;sink.dpcd[0x101]=0x82;sink.dpcd[0x115]=3;sink.dpcd[0x10A]=0x80;sink.dpcd[0x600]=1;
 }
-void edpSetup(Fixture &f,Map &map){
- setup(f,map,0,0,2,10,true);auto &c=display13FBPower;state.display13FBAUXHooksReady=true;
+void edpSetup(Fixture &f,Map &map,bool panel=true){
+ setup(f,map,0,0,2,10,panel);auto &c=display13FBPower;state.display13FBAUXHooksReady=true;
  state.display13AUXControllerSlot=reinterpret_cast<uintptr_t>(&c.controller);put(f.ctl,0xC30,c.lock);
  for(unsigned n=0;n<6;++n)put(f.port,0x594+4*n,0x64010U+4*n);
  state.orgDisplay13ReadAUX=reinterpret_cast<uintptr_t>(sinkRead);state.orgDisplay13WriteAUX=reinterpret_cast<uintptr_t>(sinkWrite);
  f.port[0x11A]=1;f.port[0x118]=0;put(f.port,0x550,1U);
  for(auto reg:{0x60544U,0x70008U,0x164280U,0x46010U,0x46014U,0x164284U,0x164288U,0x16428CU,0x164290U,0xC7200U,0xC7204U})map.regs[reg]=0;
- map.regs[0x64000]=0x80;sinkReset();
+ map.regs[0x64000]=0x80;sinkReset();sinkWrites=SinkWrites{};display13EDPLink={};
+ display13EDPOrder={};display13EDPOrderLast[0]=display13EDPOrderLast[1]=0;display13EDPOrderLast[2]=UINT32_MAX;
+ testOnDelay()=nullptr;testDelayedUs()=0;
 }
 // getDPCDInfo and the link setup read the receiver caps, the extended caps,
 // the rate table and the LINK_BW_SET they reuse. Under -wex-edp-keep every view
-// is capped at HBR; otherwise the panel's values pass unchanged.
+// is capped at HBR; otherwise the panel's values pass unchanged. ASSR is never
+// offered, and TPS4 not next to TPS3: the panel equalizes with TPS3, as the
+// firmware trains it (kern_display13_edp_link.hpp).
 void capsScenarios(bool keep,bool hook=true){
  Fixture f(0,0,0);Map map;edpSetup(f,map);
  // The decision hook is installed (any non-null original); without it the caps stay native.
@@ -44,11 +56,151 @@ void capsScenarios(bool keep,bool hook=true){
  assert(!XE::wrapDisplay13ReadAUX(f.port,0,caps,16) && !XE::wrapDisplay13ReadAUX(f.port,0x2200,ext,16));
  assert(!XE::wrapDisplay13ReadAUX(f.port,0x10,rates,16) && !XE::wrapDisplay13ReadAUX(f.port,0x100,bw,2));
  assert(caps[1]==(keep?0x0A:0x14) && ext[1]==(keep?0x0A:0x14) && bw[0]==(keep?0x0A:0x14) && bw[1]==0x82);
- for(unsigned i=0;i<16;++i)if(i!=1)assert(caps[i]==sink.dpcd[i] && ext[i]==sink.dpcd[0x2200+i]);
+ assert(caps[0xD]==0x08 && ext[0xD]==0x08 && display13EDPLink.assrHidden==2 && !display13EDPLink.intervalMasked);
+ assert(caps[3]==0x41 && ext[3]==0x41 && display13EDPLink.tps4Hidden==2);
+ for(unsigned i=0;i<16;++i)if(i!=1 && i!=3 && i!=0xD)assert(caps[i]==sink.dpcd[i] && ext[i]==sink.dpcd[0x2200+i]);
  for(unsigned i=0;i<16;++i)assert(rates[i]==(keep && i>=8 ? 0 : sink.dpcd[0x10+i]));
  // Only the donor's view changes: the sink keeps its own values.
- assert(sink.dpcd[0x1]==0x14 && sink.dpcd[0x100]==0x14);
+ assert(sink.dpcd[0x1]==0x14 && sink.dpcd[0x100]==0x14 && sink.dpcd[0xD]==0x09 && sink.dpcd[3]==0xc1);
  assert(objectRefs.empty());
+}
+// The donor's training pattern writes in the firmware's and Linux's order:
+// TRAINING_PATTERN_SET goes to the panel with the next TRAINING_LANEx_SET,
+// after the source sends the pattern; for clock recovery once the DDI buffer
+// the donor enabled is active.
+using LinkWrite=std::pair<uint32_t,std::vector<uint8_t>>;
+Map *orderMap=nullptr;unsigned orderActiveAfter=0;
+void orderBufferActive(unsigned us){if(us>=orderActiveAfter)orderMap->regs[0x64000]&=~0x80U;}
+void orderScenarios(unsigned &scenarios){
+ const auto record=[](){auto &d=IORegistryEntry::getRegistryRoot()->data;auto i=d.find("WEXEDPLink");
+  std::vector<uint32_t> r;if(i!=d.end()){r.resize(i->second.size()/4);memcpy(r.data(),i->second.data(),r.size()*4);}return r;};
+ uint8_t cr[1]={0x21},eq[1]={0x23},off[1]={0},lanes[4]={0,0,0,0},raised[4]={1,1,0,0},status[6];
+ // The donor's clock recovery and equalization over an active buffer.
+ {Fixture f(0,0,0);Map map;edpSetup(f,map);sinkWrites.allowed=true;map.regs[0x64000]=0x80000002;
+  assert(!XE::wrapDisplay13WriteAUX(f.port,0x102,cr,1) && sinkWrites.log.empty() && display13EDPOrder.held);
+  assert(!XE::wrapDisplay13WriteAUX(f.port,0x103,lanes,4));
+  assert((sinkWrites.log==std::vector<LinkWrite>{{0x102,{0x21,0,0,0,0}}}) && sink.dpcd[0x102]==0x21 && !testDelayedUs());
+  // Later passes write the lanes alone, and the status reads go straight out.
+  assert(!XE::wrapDisplay13ReadAUX(f.port,0x202,status,6) && !XE::wrapDisplay13WriteAUX(f.port,0x103,raised,4));
+  assert(sinkWrites.log.size()==2 && sinkWrites.log[1]==LinkWrite(0x103,{1,1,0,0}));
+  assert(!XE::wrapDisplay13WriteAUX(f.port,0x102,eq,1) && sinkWrites.log.size()==2);
+  assert(!XE::wrapDisplay13WriteAUX(f.port,0x103,raised,4) && sinkWrites.log[2]==LinkWrite(0x102,{0x23,1,1,0,0}));
+  // The end of training is not held.
+  assert(!XE::wrapDisplay13WriteAUX(f.port,0x102,off,1) && sinkWrites.log[3]==LinkWrite(0x102,{0}) && sinkWrites.log.size()==4);
+  const auto r=record();
+  assert(r.size()==15 && r[8]==2 && r[9]==2 && !r[10] && !r[11] && !r[12] && !r[13] && !r[14]);
+  ++scenarios;}
+ // Clock recovery waits for the buffer to leave idle, 10 us at a time; a
+ // buffer still idle after 10 ms gets the write anyway.
+ {Fixture f(0,0,0);Map map;edpSetup(f,map);sinkWrites.allowed=true;map.regs[0x64000]=0x80000082;
+  orderMap=&map;orderActiveAfter=370;testOnDelay()=orderBufferActive;
+  assert(!XE::wrapDisplay13WriteAUX(f.port,0x102,cr,1) && !XE::wrapDisplay13WriteAUX(f.port,0x103,lanes,4));
+  assert(testDelayedUs()==370 && sinkWrites.log.size()==1 && record()[12]==370 && !record()[13]);
+  testOnDelay()=nullptr;testDelayedUs()=0;map.regs[0x64000]=0x80000082;
+  assert(!XE::wrapDisplay13WriteAUX(f.port,0x102,cr,1) && !XE::wrapDisplay13WriteAUX(f.port,0x103,lanes,4));
+  assert(testDelayedUs()==10000 && sinkWrites.log.size()==2 && record()[12]==10000 && record()[13]==1);
+  // Equalization does not wait; a buffer that is off is not waited for.
+  testDelayedUs()=0;
+  assert(!XE::wrapDisplay13WriteAUX(f.port,0x102,eq,1) && !XE::wrapDisplay13WriteAUX(f.port,0x103,lanes,4) && !testDelayedUs());
+  map.regs[0x64000]=0x80;
+  assert(!XE::wrapDisplay13WriteAUX(f.port,0x102,cr,1) && !XE::wrapDisplay13WriteAUX(f.port,0x103,lanes,4) && !testDelayedUs());
+  assert(sinkWrites.log.size()==4 && sinkWrites.log[3]==LinkWrite(0x102,{0x21,0,0,0,0}));
+  ++scenarios;}
+ // A read before the lanes, a second pattern, the pattern cleared: the panel
+ // never misses a pattern the donor set, and sees only the last one.
+ {Fixture f(0,0,0);Map map;edpSetup(f,map);sinkWrites.allowed=true;map.regs[0x64000]=0x80000002;
+  assert(!XE::wrapDisplay13WriteAUX(f.port,0x102,cr,1) && !XE::wrapDisplay13ReadAUX(f.port,0x202,status,6));
+  assert((sinkWrites.log==std::vector<LinkWrite>{{0x102,{0x21}}}) && sink.statusReads==1 && display13EDPOrder.delivered==1);
+  assert(!XE::wrapDisplay13WriteAUX(f.port,0x102,cr,1) && !XE::wrapDisplay13WriteAUX(f.port,0x102,eq,1));
+  assert(!XE::wrapDisplay13WriteAUX(f.port,0x103,lanes,2) && sinkWrites.log[1]==LinkWrite(0x102,{0x23,0,0}));
+  assert(!XE::wrapDisplay13WriteAUX(f.port,0x102,cr,1) && !XE::wrapDisplay13WriteAUX(f.port,0x102,off,1));
+  assert(sinkWrites.log.size()==3 && sinkWrites.log[2]==LinkWrite(0x102,{0}) && display13EDPOrder.replaced==2);
+  ++scenarios;}
+ // A failed joined write fails the donor's TRAINING_LANEx_SET.
+ {Fixture f(0,0,0);Map map;edpSetup(f,map);sinkWrites.allowed=true;map.regs[0x64000]=0x80000002;sinkWrites.failing=0x102;
+  assert(!XE::wrapDisplay13WriteAUX(f.port,0x102,cr,1) && XE::wrapDisplay13WriteAUX(f.port,0x103,lanes,4)==0xE00002BCU);
+  assert(record()[14]==0xE00002BCU && !display13EDPOrder.held);
+  ++scenarios;}
+ sinkWrites=SinkWrites{};display13EDPOrder={};
+}
+// The panel's link training as the firmware and Linux run it
+// (kern_display13_edp_link.hpp): the donor's reads of the receiver caps, its
+// link configuration writes and the order of its training pattern writes.
+void linkScenarios(){
+ unsigned scenarios=0;
+ const auto record=[](){auto &d=IORegistryEntry::getRegistryRoot()->data;auto i=d.find("WEXEDPLink");
+  std::vector<uint32_t> r;if(i!=d.end()){r.resize(i->second.size()/4);memcpy(r.data(),i->second.data(),r.size()*4);}return r;};
+ // getDPCDInfo: the 16-byte caps keep the extended caps flag and show TPS3
+ // without TPS4; the EDP_CONFIGURATION_CAP / TRAINING_AUX_RD_INTERVAL pair
+ // shows interval 0 and no ASSR; TRAINING_AUX_RD_INTERVAL alone shows 0 too.
+ {Fixture f(0,0,0);Map map;edpSetup(f,map);state.orgDisplay13RegsNeedUpdate=1;
+  uint8_t caps[16],ext[16],pair[2],interval[1];
+  assert(!XE::wrapDisplay13ReadAUX(f.port,0,caps,16) && !XE::wrapDisplay13ReadAUX(f.port,0x2200,ext,16));
+  assert(caps[0xE]==0x80 && ext[0xE]==0x80 && caps[0xD]==0x08 && ext[0xD]==0x08);
+  assert(caps[2]==0xc2 && ext[2]==0xc2 && caps[3]==0x41 && ext[3]==0x41);
+  assert(!XE::wrapDisplay13ReadAUX(f.port,0xD,pair,2) && pair[0]==0x08 && pair[1]==0x00);
+  assert(!XE::wrapDisplay13ReadAUX(f.port,0xE,interval,1) && interval[0]==0x00);
+  assert(display13EDPLink.assrHidden==3 && display13EDPLink.intervalMasked==2);
+  assert(sink.dpcd[0xD]==0x09 && sink.dpcd[0xE]==0x80 && sink.dpcd[3]==0xc1);
+  // Published as soon as the view changes, before any link configuration.
+  auto r=record();assert(r.size()==15 && r[0]==2 && r[1]==3 && r[2]==2 && r[7]==2);
+  ++scenarios;}
+ // Without TPS4 the panel equalizes with unscrambled patterns and keeps ASSR;
+ // the interval is still read as 0.
+ {Fixture f(0,0,0);Map map;edpSetup(f,map);sink.dpcd[3]=sink.dpcd[0x2203]=0x41;
+  uint8_t caps[16],pair[2];
+  assert(!XE::wrapDisplay13ReadAUX(f.port,0,caps,16) && !XE::wrapDisplay13ReadAUX(f.port,0xD,pair,2));
+  assert(caps[0xD]==0x09 && pair[0]==0x09 && pair[1]==0x00 && !display13EDPLink.assrHidden && display13EDPLink.intervalMasked==1);
+  assert(caps[3]==0x41 && !display13EDPLink.tps4Hidden);
+  ++scenarios;}
+ // TPS4 in the extended caps alone counts for both copies.
+ {Fixture f(0,0,0);Map map;edpSetup(f,map);sink.dpcd[3]=0x41;
+  uint8_t ext[16],caps[16];
+  assert(!XE::wrapDisplay13ReadAUX(f.port,0x2200,ext,16) && !XE::wrapDisplay13ReadAUX(f.port,0,caps,16));
+  assert(ext[0xD]==0x08 && caps[0xD]==0x08 && display13EDPLink.assrHidden==2);
+  assert(ext[3]==0x41 && caps[3]==0x41 && display13EDPLink.tps4Hidden==1);
+  ++scenarios;}
+ // TPS4 without TPS3 stays: the donor equalizes with TPS4, as the firmware would.
+ {Fixture f(0,0,0);Map map;edpSetup(f,map);sink.dpcd[2]=sink.dpcd[0x2202]=0x82;
+  uint8_t caps[16],ext[16];
+  assert(!XE::wrapDisplay13ReadAUX(f.port,0,caps,16) && !XE::wrapDisplay13ReadAUX(f.port,0x2200,ext,16));
+  assert(caps[3]==0xc1 && ext[3]==0xc1 && !display13EDPLink.tps4Hidden && caps[0xD]==0x08);
+  ++scenarios;}
+ // The link configuration: D0 and 8b/10b, then the donor's LINK_BW_SET.
+ {Fixture f(0,0,0);Map map;edpSetup(f,map);sinkWrites.allowed=true;IORegistryEntry::getRegistryRoot()->data.erase("WEXEDPLink");
+  std::vector<uint32_t> r;sink.dpcd[0x600]=2;sink.dpcd[0x108]=0;const unsigned before=display13EDPLinkConfigs,slept=testSleptMs();
+  uint8_t link[2]={0x0A,0x82},pattern[1]={0x21};
+  assert(!XE::wrapDisplay13WriteAUX(f.port,0x100,link,2));
+  assert((sinkWrites.log==std::vector<LinkWrite>{{0x600,{1}},{0x108,{1}},{0x100,{0x0A,0x82}}}));
+  assert(sink.dpcd[0x600]==1 && sink.dpcd[0x108]==1 && display13EDPLinkConfigs==before+1 && testSleptMs()==slept);
+  r=record();assert(r.size()==15 && r[0]==2 && r[3]==before+1 && !r[4] && !r[5] && !r[6]);
+  // Other writes pass alone, including a block that stops short of 0x100; a
+  // held training pattern goes out before it.
+  uint8_t block[2]={0x00,0x00};
+  assert(!XE::wrapDisplay13WriteAUX(f.port,0x102,pattern,1) && sinkWrites.log.size()==3);
+  assert(!XE::wrapDisplay13WriteAUX(f.port,0xFE,block,2));
+  assert(sinkWrites.log.size()==5 && sinkWrites.log[3]==LinkWrite(0x102,{0x21}) && sinkWrites.log[4]==LinkWrite(0xFE,{0,0}));
+  assert(display13EDPLinkConfigs==before+1 && display13EDPOrder.holds==1 && display13EDPOrder.delivered==1);
+  ++scenarios;}
+ // A receiver that refuses D0: three tries 1 ms apart, then the training goes on.
+ {Fixture f(0,0,0);Map map;edpSetup(f,map);sinkWrites.allowed=true;sinkWrites.failing=0x600;
+  const unsigned slept=testSleptMs();uint8_t link[2]={0x0A,0x82};
+  assert(!XE::wrapDisplay13WriteAUX(f.port,0x100,link,2));
+  assert(sinkWrites.log.size()==5 && sinkWrites.log[3]==LinkWrite(0x108,{1}) && sinkWrites.log[4]==LinkWrite(0x100,{0x0A,0x82}));
+  auto r=record();assert(r[4]==0xE00002BCU && r[5]==3 && !r[6] && testSleptMs()==slept+3);
+  ++scenarios;}
+ // Another port (an external DisplayPort sink on DDI A) keeps its caps and writes.
+ {Fixture f(0,0,0);Map map;edpSetup(f,map,false);sinkWrites.allowed=true;
+  uint8_t caps[16],pair[2],link[2]={0x0A,0x82},pattern[1]={0x21},lanes[4]={0,0,0,0};
+  assert(!XE::wrapDisplay13ReadAUX(f.port,0,caps,16) && !XE::wrapDisplay13ReadAUX(f.port,0xD,pair,2));
+  assert(caps[0xD]==0x09 && pair[0]==0x09 && pair[1]==0x80 && caps[3]==0xc1 && !display13EDPLink.tps4);
+  assert(!XE::wrapDisplay13WriteAUX(f.port,0x100,link,2) && sinkWrites.log.size()==1);
+  assert(!XE::wrapDisplay13WriteAUX(f.port,0x102,pattern,1) && !XE::wrapDisplay13WriteAUX(f.port,0x103,lanes,4));
+  assert((sinkWrites.log==std::vector<LinkWrite>{{0x100,{0x0A,0x82}},{0x102,{0x21}},{0x103,{0,0,0,0}}}) && !display13EDPOrder.holds);
+  ++scenarios;}
+ orderScenarios(scenarios);
+ sinkWrites=SinkWrites{};display13EDPLink={};
+ printf("PASS Display13 eDP link: interval 0, no ASSR and TPS3 in the donor's caps view, D0 and 8b/10b before the link configuration, training patterns after the source (%u scenarios)\n",scenarios);
 }
 // The panel path the firmware lit: pipe A -> DDI A eDP SST x2, 8 bpc,
 // 1920x1200 from the panel's EDID DTD (154.25 MHz, 1920+160 x 1200+36, sync
@@ -402,6 +554,7 @@ int main(int argc,char **argv){
  capsScenarios(keep);
  // A donor build the decision hook does not match keeps nothing: its caps stay native.
  capsScenarios(keep,false);
+ linkScenarios();
  if(keep){keepScenarios();blankScenarios();}else offScenario();
  return 0;
 }
