@@ -57,6 +57,8 @@
 #include "kern_tgl_combo_signal.hpp"
 #include "kern_display13_edp_keep.hpp"
 #include "kern_display13_edp_blank.hpp"
+#include "kern_display13_combo_phy.hpp"
+#include "kern_display13_core.hpp"
 #include "kern_tgl_panel_depth.hpp"
 #include "kern_xelp_panel_power.hpp"
 #include "kern_display13_panel.hpp"
@@ -10440,6 +10442,61 @@ void XE::wrapAlderLakeNPowerOverride(void *power,bool enable) {
 	adlnPublishPowerRecord("N97FBPowerOverride",record);
 }
 
+// Combo PHY initialization after a power loss (kern_display13_combo_phy.hpp):
+// writes only PHY_MISC and the combo PHY A/B registers that sequence programs.
+struct Display13FBComboPHYIO : Display13FBBootIO {
+ explicit Display13FBComboPHYIO(IOMemoryMap *m):Display13FBBootIO{m} {}
+ uint32_t read(uint32_t r) const {return readable(r) ? Display13FBPowerIO::read(r) : UINT32_MAX;}
+ void write(uint32_t r,uint32_t v) {
+  namespace P=Display13ComboPHY;
+  const uint32_t offsets[]={P::TxDW8Group,P::PcsDW1Group,P::CompDW1,P::CompDW9,P::CompDW10,P::CompDW8,P::CompDW0,P::ClDW5};
+  bool allowed=false;
+  for(uint32_t phy=0;phy<P::Count;++phy) {
+   if(r==P::phyMisc(phy))allowed=true;
+   for(auto o:offsets)if(r==P::base(phy)+o)allowed=true;
+  }
+  if(allowed && readable(r))*reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress()+r)=v;
+ }
+};
+// WEXDisplay13ComboPHY, after each restore that found the display powered off
+// on the eDP/DP path: version 1, then per PHY (A, B): initialized before,
+// PORT_COMP_DW0 and PHY_MISC before, initialized after, PORT_COMP_DW0,
+// TX_DW8 lane 0, PCS_DW1 lane 0 and CL_DW5 after.
+static void display13ComboPHYRestore(IOMemoryMap *map) {
+ namespace P=Display13ComboPHY;
+ Display13FBComboPHYIO io{map};uint32_t record[1+8*P::Count]={1};
+ for(uint32_t phy=0;phy<P::Count;++phy) {
+  auto r=record+1+8*phy;const auto b=P::base(phy);
+  r[0]=P::enabled(io,phy);r[1]=io.read(b+P::CompDW0);r[2]=io.read(P::phyMisc(phy));
+  r[3]=r[0] ? 1 : P::init(io,phy);
+  r[4]=io.read(b+P::CompDW0);r[5]=io.read(b+P::TxDW8Lane0);r[6]=io.read(b+P::PcsDW1Lane0);r[7]=io.read(b+P::ClDW5);
+ }
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13ComboPHY",record,sizeof(record));
+}
+// The display core registers Linux sets again on resume (kern_display13_core.hpp).
+struct Display13FBCoreIO : Display13FBBootIO {
+ explicit Display13FBCoreIO(IOMemoryMap *m):Display13FBBootIO{m} {}
+ uint32_t read(uint32_t r) const {return readable(r) ? Display13FBPowerIO::read(r) : UINT32_MAX;}
+ void write(uint32_t r,uint32_t v) {
+  namespace K=Display13Core;
+  bool allowed=false;
+  for(const auto &e:K::core)if(r==e.reg)allowed=true;
+  for(uint32_t pipe=0;pipe<K::Pipes;++pipe)if(r==K::pipeChicken(pipe))allowed=true;
+  if(allowed && readable(r))*reinterpret_cast<volatile uint32_t *>(map->getVirtualAddress()+r)=v;
+ }
+};
+// WEXDisplay13Core, after each restore that found the display powered off:
+// version 1, entries written (bit i), then before and after for
+// CHICKEN_MISC_2, XELPD_DISPLAY_ERR_FATAL_MASK, CHICKEN_DCPR_1 and
+// PIPE_CHICKEN A-C (UINT32_MAX: not read).
+static void display13CoreRestore(IOMemoryMap *map) {
+ namespace K=Display13Core;
+ Display13FBCoreIO io{map};const auto wells=io.read(Display13Power::Driver);
+ const auto r=K::restore(io,[&](uint32_t pipe){return Display13FBIRQ::powered(wells,pipe);});
+ constexpr uint32_t n=K::CoreCount+K::Pipes;uint32_t record[2+2*n]={1,r.written};
+ for(uint32_t i=0;i<n;++i) {record[2+i]=r.before[i];record[2+n+i]=r.after[i];}
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13Core",record,sizeof(record));
+}
 // Called with the display owner lock. No framebuffer or connector owns this
 // transition. Native global wake and a transport that bypasses native wake
 // both enter here; a second caller must not reset an already running peer.
@@ -10498,6 +10555,12 @@ bool XE::restoreDisplay13ResourcesLocked(void *power,bool waking) {
         cold[3]=io.read(reg);return cold[3]!=UINT32_MAX && (cold[3]&1);
     };
     result=Display13Power::restore(io,c.bridge.state,c.restorePending,selectDSI);
+    // The combo PHYs lost their initialization with the display power, as in
+    // Linux's display core init. The DSI path restores PHY A from its boot image.
+    if(result.status==Display13Power::Status::Complete && c.restorePending && !callbackXE->adlnOutputWiring.dsi)
+        display13ComboPHYRestore(c.map);
+    // So did the core registers of Linux's display core init, before any plane scans out.
+    if(result.status==Display13Power::Status::Complete && c.restorePending)display13CoreRestore(c.map);
     if(result.status==Display13Power::Status::Complete && c.restorePending) {
         // No clock/MBUS writes after any output starts scanning out.
         if(!Display13FBIRQ::consumersStopped(io,7,c.transcoders))result.status=Display13Power::Status::NotReady;
