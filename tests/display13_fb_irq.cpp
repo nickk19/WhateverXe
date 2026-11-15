@@ -48,6 +48,41 @@ struct IO {
     }
 };
 int main() {
+    // A system sleep with every output lit by a later modeset: at the native
+    // enable no pipe is admitted or running, and the restore waits without a
+    // write or a fault. The first activation of the admitted pipe restores
+    // the interrupts and hotplug, then its vblank (wrapDisplay13FBConfigureVBL).
+    {IO io;State s;
+     assert(enable(io,s)==Status::Complete && s.active==1 && (io.r[DDIControl]&DDIEnable)==DDIEnable);
+     IO cold;cold.r[0x70008]=0;cold.r[DDIControl]=0;
+     const auto none=cold.writes.size();
+     assert(restoreAfterPowerLoss(cold,s,0)==Status::Topology && cold.writes.size()==none);
+     assert(restoreAfterPowerLoss(cold,s,1)==Status::Topology && cold.writes.size()==none && !s.faulted);
+     cold.r[0x70008]=0xC0000000;  // the modeset enabled pipe A
+     assert(restoreAfterPowerLoss(cold,s,1)==Status::Complete && s.enabled && s.active==1 && !s.faulted);
+     assert((cold.r[Master]&Enable) && (cold.r[DDIControl]&DDIEnable)==DDIEnable);
+     assert(extendActivePipes(cold,s,1)==Status::Complete && s.active==1);
+     assert(vblank(cold,s,0,true)==Status::Complete && (cold.r[PipeIIR(0)+4]&1) && !(cold.r[PipeIIR(0)-4]&1));
+    }
+    // A display sleep: the native Doze disables the master and the panel's
+    // pipe stops, every bank keeps its programming. The wake's enable comes
+    // before the modeset lights the pipe: nothing to extend and nothing
+    // written, no fault. The first activation of the pipe completes the
+    // enable (wrapDisplay13FBConfigureVBL), then its vblank.
+    {IO io;State s;
+     assert(enable(io,s)==Status::Complete && s.active==1);
+     assert(disable(io,s)==Status::Complete && !s.enabled && !(io.r[Master]&Enable));
+     io.r[0x70008]=0;io.r[0xC4008]=1U<<16; // pipe A off, the panel's HPD pulse pending
+     const auto none=io.writes.size();
+     const auto actual=readActivePipes(io,1,s.transcoders);
+     assert(actual.status==Status::Topology && !actual.active);
+     assert(extendActivePipes(io,s,1)==Status::Unavailable && io.writes.size()==none && !s.faulted);
+     io.r[0x70008]=0xC0000000;  // the modeset enabled pipe A
+     assert(restoreAfterPowerLoss(io,s,1)==Status::Complete && s.enabled && s.active==1 && !s.faulted);
+     assert((io.r[Master]&Enable) && (io.r[GfxMaster]&Enable) && (io.r[DDIControl]&DDIEnable)==DDIEnable);
+     assert((io.r[0xC400C]&(3U<<16))==(3U<<16) && !(io.r[0xC4004]&(3U<<16)));
+     assert(vblank(io,s,0,true)==Status::Complete && (io.r[PipeIIR(0)+4]&1) && !(io.r[PipeIIR(0)-4]&1));
+    }
     // Cold wake erased both peer IRQ banks and HPD programming. Restore only
     // actually restarted pipes, while re-enabling both selected connectors.
     {IO io;State s;s.transcoders.dsi0Pipe=0;

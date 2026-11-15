@@ -266,6 +266,8 @@ template<class IO> Status enable(IO &io,State &s,uint32_t excludedPCH=0,uint32_t
 // Caller has proved total display power loss and restored its power/clock
 // dependencies. Cached armed banks no longer describe hardware. Reinstall
 // both pipe interrupts and connector detection, not just the live DSI bank.
+// A display sleep's Doze lost nothing but disabled the master; the same full
+// enable completes its wake.
 template<class IO> Status restoreAfterPowerLoss(IO &io,State &s,uint32_t allowed) {
     if(!s.begun || s.faulted)return Status::Unavailable;
     const auto actual=readActivePipes(io,allowed,s.transcoders);

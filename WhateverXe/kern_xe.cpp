@@ -4799,7 +4799,7 @@ struct Display13FBIRQContext {
 	IOSimpleLock *lock {};
 	IOService *controller {};
 	Display13FBIRQ::State state;
-	unsigned handlers {},softwareHandlers {};bool quiescing {},powerLost {};uint32_t blockedPipes {};
+	unsigned handlers {},softwareHandlers {};bool quiescing {},powerLost {},enablePending {};uint32_t blockedPipes {};
 	uintptr_t softwareThread {};
 	Display13FBIRQ::HandlerScopes scopes;
 	volatile uint32_t admittedPipes {}; // Release-published after actual path/backing proof.
@@ -6098,6 +6098,14 @@ bool XE::processDisplay13FramebufferIRQ(KernelPatcher &patcher,size_t index,mach
 	patcher.clearError();return swRouted;
 }
 
+// WEXDisplay13IRQWake: display interrupts restored at a pipe's activation
+// after a power loss or a display sleep: version 1, attempts, last status,
+// last pipe, restores completed. Published outside the native IRQ lock.
+static uint32_t display13IRQWake[5]={1,0,0,UINT32_MAX,0};
+static void display13IRQWakePublish() {
+	uint32_t record[5];memcpy(record,display13IRQWake,sizeof(record));
+	if(record[1])IORegistryEntry::getRegistryRoot()->setProperty("WEXDisplay13IRQWake",record,sizeof(record));
+}
 IOReturn XE::wrapDisplay13FBEnableIRQ(IOService *controller) {
 	if(!callbackXE->display13FBIRQReady || !adlnIRQOwner(controller))return kIOReturnNotReady;
 	auto &c=display13FBIRQ;uint64_t record[32] {},check[42] {3};Display13FBIRQIO io {c.base};
@@ -6126,6 +6134,11 @@ IOReturn XE::wrapDisplay13FBEnableIRQ(IOService *controller) {
 		c.status=c.quiescing ? Display13FBIRQ::Status::Power : actual.status;
 		if(c.status==Display13FBIRQ::Status::Complete)c.status=c.state.begun && c.state.enabled ?
 			Display13FBIRQ::extendActivePipes(io,c.state,admitted) : Display13FBIRQ::enable(io,c.state,excluded,adlnSharedGT(controller),actual.active,callbackXE->adlnOutputWiring.hotplug(),callbackXE->adlnOutputWiring.typeC);
+		// The wake from a display sleep enables the interrupts its Doze
+		// disabled before the modeset lights a pipe: the enable completes at
+		// the first activation of an admitted pipe, as after a power loss.
+		c.enablePending=!c.quiescing && actual.status==Display13FBIRQ::Status::Topology && !actual.active &&
+			c.state.begun && !c.state.enabled && !c.state.faulted;
 	} else c.status=c.quiescing ? Display13FBIRQ::Status::Power : Display13FBIRQ::enable(io,c.state,excluded,adlnSharedGT(controller),1,callbackXE->adlnOutputWiring.hotplug(),callbackXE->adlnOutputWiring.typeC);
 	adlnIRQCache(controller,io);adlnIRQRecord(record,1);
 	check[23]=static_cast<uint32_t>(c.status);check[24]=c.state.begun;
@@ -6138,7 +6151,7 @@ IOReturn XE::wrapDisplay13FBEnableIRQ(IOService *controller) {
 	check[39]=excluded;check[40]=io.read(0xC400C);check[41]=io.read(0xC4004);
 	const bool enabled=c.status==Display13FBIRQ::Status::Complete;
 	IOSimpleLockUnlockEnableInterrupt(c.lock,saved);
-	controller->setProperty("N97FBIRQ",record,sizeof(record));
+	controller->setProperty("N97FBIRQ",record,sizeof(record));display13IRQWakePublish();
 	IORegistryEntry::getRegistryRoot()->setProperty("N97FBIRQEnableCheck",check,sizeof(check));
 	if(!check[3])IORegistryEntry::getRegistryRoot()->setProperty("N97FBIRQFirstEnableCheck",check,sizeof(check));
 	return enabled ? kIOReturnSuccess : kIOReturnNotReady;
@@ -6147,6 +6160,8 @@ IOReturn XE::wrapDisplay13FBDisableIRQ(IOService *controller) {
 	if(!adlnIRQOwner(controller))return kIOReturnNotReady;
 	auto &c=display13FBIRQ;uint64_t record[32] {};Display13FBIRQIO io {c.base};
 	const auto saved=IOSimpleLockLockDisableInterrupt(c.lock);
+	// A later activation must not enable what the donor disabled again.
+	c.enablePending=false;
 	c.status=Display13FBIRQ::disable(io,c.state);adlnIRQCache(controller,io);adlnIRQRecord(record,2);
 	const bool disabled=c.status==Display13FBIRQ::Status::Complete;
 	IOSimpleLockUnlockEnableInterrupt(c.lock,saved);
@@ -6157,6 +6172,7 @@ void XE::wrapDisplay13FBConfigureVBL(IOService *controller,IOService *fb,OSObjec
 	if(!adlnIRQOwner(controller) || !fb || !path)return;
 	auto &c=display13FBIRQ;Display13FBIRQIO io {c.base};
 	const auto saved=getLock ? IOSimpleLockLockDisableInterrupt(c.lock) : 0;
+	const auto attempts=display13IRQWake[1];
 	// getLock=false means hwSetInterruptForTransaction already holds the
 	// same native simple lock. Never recurse or overwrite its saved IRQ state.
 	const bool valid=display13FBAssociations(controller,0x1C20,fb,fb->getMetaClass()->getClassSize(),display13FBExpectedOwner(controller)) &&
@@ -6167,10 +6183,28 @@ void XE::wrapDisplay13FBConfigureVBL(IOService *controller,IOService *fb,OSObjec
 		if(getLock)IOSimpleLockUnlockEnableInterrupt(c.lock,saved);return;
 	}
 	if(valid && pipe<3 && !(c.blockedPipes&(1U<<pipe))) {
+		// After a power loss, or the Doze of a display sleep, the native enable
+		// restores the display interrupts only over an admitted, running pipe.
+		// A wake that lights its outputs in a later modeset has none then, and
+		// the restore stays pending: the first activation of an admitted pipe
+		// restores them, hotplug included, as i915 re-arms them once its
+		// modeset has lit the pipe.
+		if(enabled && (c.powerLost || c.enablePending) && !c.quiescing) {
+			const auto admitted=__atomic_load_n(&c.admittedPipes,__ATOMIC_ACQUIRE);
+			if(admitted&(1U<<pipe)) {
+				c.status=Display13FBIRQ::restoreAfterPowerLoss(io,c.state,admitted);
+				if(c.status==Display13FBIRQ::Status::Complete) {c.powerLost=false;c.enablePending=false;++display13IRQWake[4];}
+				++display13IRQWake[1];display13IRQWake[2]=static_cast<uint32_t>(c.status);display13IRQWake[3]=pipe;
+			}
+		}
 		if(Display13FBTopology::multiOutputWiring(callbackXE->adlnOutputWiring) && enabled && !c.quiescing) {
 			const auto admitted=__atomic_load_n(&c.admittedPipes,__ATOMIC_ACQUIRE);
 			c.status=(admitted&(1U<<pipe)) ? Display13FBIRQ::extendActivePipes(io,c.state,admitted) : Display13FBIRQ::Status::Topology;
-			if(c.status!=Display13FBIRQ::Status::Complete) {adlnIRQCache(controller,io);if(getLock)IOSimpleLockUnlockEnableInterrupt(c.lock,saved);return;}
+			if(c.status!=Display13FBIRQ::Status::Complete) {
+				adlnIRQCache(controller,io);
+				if(getLock) {IOSimpleLockUnlockEnableInterrupt(c.lock,saved);if(display13IRQWake[1]!=attempts)display13IRQWakePublish();}
+				return;
+			}
 		}
 		// Native enablePipe enables PIPECONF before this VBL callback. Re-arm
 		// the full pipe bank only at that real activation boundary after idle HPD.
@@ -6184,7 +6218,7 @@ void XE::wrapDisplay13FBConfigureVBL(IOService *controller,IOService *fb,OSObjec
 	}
 	else c.status=Display13FBIRQ::fail(io,c.state,Display13FBIRQ::Status::Topology);
 	adlnIRQCache(controller,io);
-	if(getLock)IOSimpleLockUnlockEnableInterrupt(c.lock,saved);
+	if(getLock) {IOSimpleLockUnlockEnableInterrupt(c.lock,saved);if(display13IRQWake[1]!=attempts)display13IRQWakePublish();}
 }
 bool XE::wrapDisplay13FBProcessIRQ(IOService *controller) {
 	if(!adlnIRQOwner(controller))return false;
