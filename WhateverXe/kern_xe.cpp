@@ -13805,21 +13805,36 @@ uint32_t XE::wrapDisplay13PanelPower(void *controller,uint32_t state) {
 
 // -wex-edp-blank (Display13EDPBlank), on top of -wex-edp-keep: the power callback
 // of the boot panel path whose latest mode-set decision kept the link does not
-// run the donor's Doze/Wake transition (it stops the link, runs a complete mode
-// set and leaves an OLED eDP 1.4 panel dark). It only clears/restores the
-// primary plane and cursor enables of pipe A and records the new power state
-// (+0x4284), as the DSI power path does. Any other framebuffer, or a path
-// whose link was not kept, takes the donor's own transition and never touches
-// pipe A; the blanked panel's own next Wake always brings it back (without a
-// register write when pipe A no longer scans it out or the display hardware is
-// down). Off (0), which the donor enters through prepareToEnterSleep and leaves
-// through prepareToExitSleep, is blanked the same way, so both are skipped too;
-// untested across a sleep that powers the display hardware off.
-// WEXEDPBlank (uint32_t[11], the panel's framebuffer only): version 2,
+// run the donor's Wake -> Doze -> Wake transition (it stops the link, runs a
+// complete mode set and leaves an OLED eDP 1.4 panel dark). It only
+// clears/restores the primary plane and cursor enables of pipe A and records
+// the new power state (+0x4284), as the DSI power path does. Any other
+// framebuffer, or a path whose link was not kept, takes the donor's own
+// transition and never touches pipe A; the blanked panel's own next callback
+// always brings it back.
+// System sleep is the donor's. Off (0) is entered through prepareToEnterSleep
+// and left through prepareToExitSleep, which own IOGraphics' sleep/wake
+// handshake; a blank skipping them leaves WindowServer waiting in IOGraphics
+// after the wake. A request for Off, or one leaving it, releases the blank
+// without a register write. A blank recorded Doze over a pipe that still
+// runs: the donor gets Wake back, so that its Wake -> Off also runs
+// prepareToExitWake (display off, panel power-down) before
+// prepareToEnterSleep, as for a sleep from an awake display.
+// Unblank and keep also need the hardware: TRANSCONF_A enabled and active,
+// the panel DDI's buffer enabled and the panel powered. After a reset under
+// the software state (a sleep or hibernation the callbacks did not see) the
+// blank is released without a register write and the donor's own transition
+// follows.
+// WEXEDPBlank (uint32_t[16], the panel's framebuffer only): version 3,
 // requested state, previous state, eligible, action (0 donor, 1 blank,
-// 2 unblank, 3 nothing to do), blanks, unblanks, plane and cursor control seen
-// when blanking, forgets (blank released without a register write), flags
-// (bit0 the framebuffer owns the blank, bit1 pipe A scans out the boot panel).
+// 2 unblank, 3 nothing to do, 4 release), blanks, unblanks, plane and cursor
+// control seen when blanking, releases (blank dropped without a register
+// write), flags (bit0 the framebuffer owns the blank, bit1 pipe A drives the
+// boot panel path, bit2 the scanout chain runs, bit3 Wake handed back to the
+// donor for its system sleep), last release reason
+// (1 system sleep, 2 scanout chain stopped, 3 panel no longer on pipe A),
+// releases for system sleep, then TRANSCONF_A, DDI_BUF_CTL and PP_STATUS as
+// read by this callback (all ones when not read).
 // WEXEDPBlankReady: the flag, the keep decision hook and a native eDP panel.
 static bool display13EDPBlankRequested() {
  static int v=-1;if(v<0)v=display13EDPKeep() && checkKernelArgument("-wex-edp-blank") ? 1 : 0;
@@ -13842,50 +13857,60 @@ bool XE::display13EDPBlankPower(IOService *fb,uint32_t state,uint32_t &result) {
  display13EDPBlankPublishReady();
  auto s=callbackXE;auto &c=display13FBPower;auto &b=display13EDPBlankState;
  if(!display13EDPBlankRequested() || !s || !c.lock || !c.map || !fb || s->adlnOutputWiring.dsi)return false;
- B::Action action=B::Action::Native;bool eligible=false,owner=false,panel=false,scanout=false,forgot=false;
- uint32_t current=UINT32_MAX;
+ B::Decision decision {B::Action::Native,B::Reason::None};
+ bool eligible=false,owner=false,panel=false,scanout=false,live=false,handled=false,woken=false;
+ uint32_t current=UINT32_MAX,seen[3]={UINT32_MAX,UINT32_MAX,UINT32_MAX};
  if(s->ownedDisplay13Framebuffer(fb)) {
   IOLockLock(c.lock);
   owner=b.blanked && b.fb==reinterpret_cast<uintptr_t>(fb);
   const auto base=c.map->getVirtualAddress();
-  auto path=Display13FBMemory::singlePath<OSObject *>(fb);
-  if(base && c.map->getLength()==0x1000000 && path && path->getMetaClass()->getClassSize()>=0x3730) {
-   current=Display13FBMemory::field<uint32_t>(fb,0x4284);
-   // Pipe A still scans out the adopted boot panel and the display hardware
-   // is up; eligible: attached, and its latest mode-set decision kept the
-   // firmware's link.
-   panel=c.bridge.bootPath==reinterpret_cast<uintptr_t>(path);
-   scanout=panel && c.bootPanel && c.bridge.bootAdopted && !c.bridge.state.faulted && !c.bridge.state.suspended &&
-    Display13FBMemory::field<void *>(path,0x3648) && !Display13FBMemory::field<uint32_t>(path,0x3640);
-   eligible=scanout && Display13FBMemory::field<uint32_t>(path,0x3644)==2 &&
-    display13EDPKeepPath==reinterpret_cast<uintptr_t>(path);
-  }
-  action=B::decide(eligible,owner,current,state,b.blanked);
   struct IO {
    uintptr_t base;
    uint32_t read(uint32_t o) {return *reinterpret_cast<volatile uint32_t *>(base+o);}
    void write(uint32_t o,uint32_t v) {*reinterpret_cast<volatile uint32_t *>(base+o)=v;}
   } io {base};
-  if(action==B::Action::Blank) {B::blank(io,b);b.fb=reinterpret_cast<uintptr_t>(fb);}
-  else if(action==B::Action::Unblank) {
-   if(scanout)B::unblank(io,b);
-   else {B::forget(b);forgot=true;}
+  auto path=Display13FBMemory::singlePath<OSObject *>(fb);
+  if(base && c.map->getLength()==0x1000000 && path && path->getMetaClass()->getClassSize()>=0x3730) {
+   current=Display13FBMemory::field<uint32_t>(fb,0x4284);
+   // Pipe A still drives the adopted boot panel path; eligible: attached, and
+   // its latest mode-set decision kept the firmware's link.
+   panel=c.bridge.bootPath==reinterpret_cast<uintptr_t>(path);
+   scanout=panel && c.bootPanel && c.bridge.bootAdopted && !c.bridge.state.faulted && !c.bridge.state.suspended &&
+    Display13FBMemory::field<void *>(path,0x3648) && !Display13FBMemory::field<uint32_t>(path,0x3640);
+   eligible=scanout && Display13FBMemory::field<uint32_t>(path,0x3644)==2 &&
+    display13EDPKeepPath==reinterpret_cast<uintptr_t>(path);
+   if(panel)live=B::running(io,c.bridge.bootPort,seen);
   }
-  if(eligible && action!=B::Action::Native)*reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(fb)+0x4284)=state;
+  decision=B::decide(eligible,scanout,live,owner,current,state,b.blanked);
+  if(decision.action==B::Action::Blank) {B::blank(io,b);b.fb=reinterpret_cast<uintptr_t>(fb);}
+  else if(decision.action==B::Action::Unblank)B::unblank(io,b);
+  else if(decision.action==B::Action::Release) {
+   B::release(b,decision.reason);
+   woken=decision.reason==B::Reason::SystemSleep && live && current==B::Doze;
+   if(woken)*reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(fb)+0x4284)=B::Wake;
+  }
+  handled=eligible && live &&
+   (decision.action==B::Action::Blank || decision.action==B::Action::Unblank || decision.action==B::Action::Keep);
+  if(handled)*reinterpret_cast<uint32_t *>(reinterpret_cast<uint8_t *>(fb)+0x4284)=state;
   IOLockUnlock(c.lock);
  }
  // Only the panel's own framebuffer is recorded: the others' callbacks would
  // overwrite it at every wake.
  if(panel || owner) {
-  const uint32_t record[11]={2,state,current,eligible,static_cast<uint32_t>(action),b.blanks,b.unblanks,b.plane,b.cursor,b.forgets,
-   (owner ? 1U : 0U)|(scanout ? 2U : 0U)};
+  const uint32_t record[16]={3,state,current,eligible,static_cast<uint32_t>(decision.action),b.blanks,b.unblanks,b.plane,b.cursor,
+   b.releases,(owner ? 1U : 0U)|(scanout ? 2U : 0U)|(live ? 4U : 0U)|(woken ? 8U : 0U),static_cast<uint32_t>(b.lastRelease),b.sleepReleases,
+   seen[0],seen[1],seen[2]};
   IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPBlank",const_cast<uint32_t *>(record),sizeof(record));
+  const auto action=decision.action;const auto reason=decision.reason;
   SYSLOG("igfx","eDP blank: power state %u -> %u (%s)",current,state,
-   action==B::Action::Blank ? "blanked" : action==B::Action::Unblank ? (forgot ? "released, panel not scanned out" : "unblanked") :
-   action==B::Action::Keep ? "unchanged" : "donor");
+   action==B::Action::Blank ? "blanked" : action==B::Action::Unblank ? "unblanked" :
+   action==B::Action::Keep ? "unchanged" :
+   reason==B::Reason::SystemSleep ? (woken ? "released for system sleep, donor from wake" : "released for system sleep, donor") :
+   reason==B::Reason::NotRunning ? "released, scanout chain stopped, donor" :
+   reason==B::Reason::NotScannedOut ? "released, panel not on pipe A, donor" : "donor");
  }
  // Not ours (or no longer ours after an unblank): the donor's own transition.
- if(!eligible || action==B::Action::Native)return false;
+ if(!handled)return false;
  result=kIOReturnSuccess;
  return true;
 }

@@ -167,19 +167,27 @@ void keepScenarios() {
 }
 // -wex-edp-blank through the production power hook (display13EDPBlankPower):
 // the kept boot panel path blanks and unblanks the primary plane and cursor of
-// pipe A in place of the donor's Doze/Wake transition, everything else takes
-// the donor's own. The mock MMIO window is real memory (the hook writes it
-// through the mapping's virtual address, as the kernel does).
+// pipe A in place of the donor's Doze/Wake transition; system sleep and
+// everything else take the donor's own. The mock MMIO window is real memory
+// (the hook reads and writes it through the mapping's virtual address, as the
+// kernel does).
 alignas(4096) uint8_t blankMMIO[0x1000000];
 uintptr_t Map::getVirtualAddress(){return reinterpret_cast<uintptr_t>(blankMMIO);}
 volatile uint32_t &mmio(uint32_t offset){return *reinterpret_cast<volatile uint32_t *>(blankMMIO+offset);}
 namespace B=Display13EDPBlank;
 const uint32_t livePlane=0x84001008U,liveCursor=0x04000027U;
-void blankLive(){mmio(B::PlaneCtl)=livePlane;mmio(B::PlaneSurf)=0x00200000U;mmio(B::CurCtl)=liveCursor;mmio(B::CurBase)=0x01230000U;}
+// The firmware's scanout chain as the IdeaPad Slim 5 14IAH8 reads it: TRANSCONF_A,
+// DDI_BUF_CTL_A and PP_STATUS.
+const uint32_t liveTrans=0xC0000000U,liveBuf=0x80000002U,livePower=0x80000008U;
+void scanoutChain(uint32_t trans,uint32_t buf,uint32_t power){mmio(B::TransConf)=trans;mmio(B::ddiBufCtl(0))=buf;mmio(B::PPStatus)=power;}
+void blankLive() {
+ mmio(B::PlaneCtl)=livePlane;mmio(B::PlaneSurf)=0x00200000U;mmio(B::CurCtl)=liveCursor;mmio(B::CurBase)=0x01230000U;
+ scanoutChain(liveTrans,liveBuf,livePower);
+}
 std::vector<uint32_t> blankRecord() {
  auto &data=IORegistryEntry::getRegistryRoot()->data;assert(data.count("WEXEDPBlank"));
- const auto &v=data["WEXEDPBlank"];assert(v.size()==11*sizeof(uint32_t));
- std::vector<uint32_t> r(11);memcpy(r.data(),v.data(),v.size());assert(r[0]==2);return r;
+ const auto &v=data["WEXEDPBlank"];assert(v.size()==16*sizeof(uint32_t));
+ std::vector<uint32_t> r(16);memcpy(r.data(),v.data(),v.size());assert(r[0]==3);return r;
 }
 uint32_t powerOf(Fixture &f){uint32_t v;memcpy(&v,f.fb+0x4284,sizeof(v));return v;}
 // The adopted boot panel path, awake, attached on pipe A, whose latest decision kept the link.
@@ -207,14 +215,16 @@ void blankScenarios() {
   assert(power(f,1) && result==kIOReturnSuccess && powerOf(f)==1);
   assert(!(mmio(B::PlaneCtl)&B::PlaneEnable) && mmio(B::PlaneCtl)==(livePlane&~B::PlaneEnable));
   assert(!(mmio(B::CurCtl)&B::CursorMode) && mmio(B::PlaneSurf)==0x00200000U && mmio(B::CurBase)==0x01230000U);
-  {const auto r=blankRecord();assert(r[1]==1 && r[2]==2 && r[3]==1 && r[4]==unsigned(B::Action::Blank) && r[5]==1 && r[6]==0 && r[7]==livePlane && r[8]==liveCursor && r[9]==0 && r[10]==2);}
+  {const auto r=blankRecord();
+   assert(r[1]==1 && r[2]==2 && r[3]==1 && r[4]==unsigned(B::Action::Blank) && r[5]==1 && r[6]==0 && r[7]==livePlane && r[8]==liveCursor);
+   assert(r[9]==0 && r[10]==6 && r[11]==0 && r[12]==0 && r[13]==liveTrans && r[14]==liveBuf && r[15]==livePower);}
   assert(display13EDPBlankState.fb==reinterpret_cast<uintptr_t>(f.fb));
-  // Doze -> Off while dark changes nothing but the recorded state.
-  assert(power(f,0) && powerOf(f)==0 && display13EDPBlankState.blanks==1 && !(mmio(B::PlaneCtl)&B::PlaneEnable));
+  // Doze -> Doze while dark: nothing to do.
+  assert(power(f,1) && powerOf(f)==1 && display13EDPBlankState.blanks==1 && blankRecord()[4]==unsigned(B::Action::Keep));
   // Wake: the enables come back, no donor transition.
   assert(power(f,2) && result==kIOReturnSuccess && powerOf(f)==2);
   assert(mmio(B::PlaneCtl)==livePlane && mmio(B::CurCtl)==liveCursor && !display13EDPBlankState.blanked);
-  {const auto r=blankRecord();assert(r[1]==2 && r[2]==0 && r[4]==unsigned(B::Action::Unblank) && r[6]==1 && r[10]==3 && !display13EDPBlankState.fb);}
+  {const auto r=blankRecord();assert(r[1]==2 && r[2]==1 && r[4]==unsigned(B::Action::Unblank) && r[6]==1 && r[10]==7 && !display13EDPBlankState.fb);}
   // Awake again: nothing to do, still not the donor's.
   assert(power(f,2) && powerOf(f)==2 && display13EDPBlankState.blanks==1 && display13EDPBlankState.unblanks==1);
   assert(blankRecord()[4]==unsigned(B::Action::Keep));
@@ -238,11 +248,32 @@ void blankScenarios() {
   {"DSI panel",[](Fixture &){state.adlnOutputWiring.dsi=1;}},
   {"unknown power state",[](Fixture &f){put(f.fb,0x4284,7U);}},
  };
+ // The hardware must agree with the software state: transcoder enabled and
+ // active, the panel DDI's buffer enabled, the panel powered.
+ const std::pair<const char *,void (*)(Fixture &)> stopped[]={
+  {"transcoder off",[](Fixture &){scanoutChain(0,liveBuf,livePower);}},
+  {"transcoder enabled but not active",[](Fixture &){scanoutChain(0x80000000U,liveBuf,livePower);}},
+  {"DDI buffer off",[](Fixture &){scanoutChain(liveTrans,0,livePower);}},
+  {"panel power off",[](Fixture &){scanoutChain(liveTrans,liveBuf,0);}},
+  {"display reset (all zero)",[](Fixture &){scanoutChain(0,0,0);}},
+  {"display unreadable (all ones)",[](Fixture &){scanoutChain(UINT32_MAX,UINT32_MAX,UINT32_MAX);}},
+  {"boot port not the panel DDI",[](Fixture &){display13FBPower.bridge.bootPort=1;}},
+ };
  for(const auto &refusal:refusals) {
   Fixture f(0,0,0);Map map;blankPrepare(f,map);refusal.second(f);
   const auto before=powerOf(f);
   if(power(f,1)){printf("blanked despite: %s\n",refusal.first);assert(false);}
   assert(powerOf(f)==before && mmio(B::PlaneCtl)==livePlane && mmio(B::CurCtl)==liveCursor && !display13EDPBlankState.blanked);
+  assert(!locked && objectRefs.empty());++scenarios;
+ }
+ for(const auto &refusal:stopped) {
+  Fixture f(0,0,0);Map map;blankPrepare(f,map);refusal.second(f);
+  // Neither a blank nor an "already awake" answer over a stopped chain.
+  for(uint32_t st:{1U,2U}) {
+   if(power(f,st)){printf("handled despite: %s\n",refusal.first);assert(false);}
+   assert(powerOf(f)==2 && mmio(B::PlaneCtl)==livePlane && mmio(B::CurCtl)==liveCursor && !display13EDPBlankState.blanked);
+   assert(blankRecord()[4]==unsigned(B::Action::Native) && !(blankRecord()[10]&4));
+  }
   assert(!locked && objectRefs.empty());++scenarios;
  }
  // A native doze stays native, also when it wakes.
@@ -272,18 +303,74 @@ void blankScenarios() {
   // Awake, the others' callbacks still take the donor's path and leave pipe A alone.
   assert(!power(ext,2) && !power(offline,2) && mmio(B::PlaneCtl)==livePlane);
   assert(!locked && objectRefs.empty());++scenarios;}
- // The panel's wake with the display hardware down (a real system sleep left
- // the bridge suspended) or pipe A no longer on the boot panel releases the
- // blank without writing a register, and hands over to the donor.
- for(int variant=0;variant<3;++variant) {
+ // The panel's next callback with pipe A no longer on the boot panel (the
+ // bridge suspended or faulted, the path moved to pipe B) or with the scanout
+ // chain stopped under the software state (a reset the callbacks did not
+ // see) releases the blank without writing a register, and hands over to the
+ // donor, which still sees its doze.
+ for(int variant=0;variant<6;++variant)
+  for(uint32_t st:{2U,1U}) {
+   Fixture f(0,0,0);Map map;blankPrepare(f,map);
+   assert(power(f,1));const auto dark=mmio(B::PlaneCtl);const auto darkCursor=mmio(B::CurCtl);
+   if(variant==0)display13FBPower.bridge.state.suspended=true;
+   else if(variant==1)display13FBPower.bridge.state.faulted=true;
+   else if(variant==2)put(f.path,0x3640,1U);
+   else if(variant==3)scanoutChain(0,0,0);
+   else if(variant==4)scanoutChain(liveTrans,0,livePower);
+   else scanoutChain(liveTrans,liveBuf,0);
+   assert(!power(f,st) && mmio(B::PlaneCtl)==dark && mmio(B::CurCtl)==darkCursor && !(dark&B::PlaneEnable));
+   assert(!display13EDPBlankState.blanked && !display13EDPBlankState.fb && powerOf(f)==1);
+   assert(display13EDPBlankState.releases==1 && display13EDPBlankState.unblanks==0 && !display13EDPBlankState.sleepReleases);
+   {const auto r=blankRecord();const auto reason=variant<3 ? B::Reason::NotScannedOut : B::Reason::NotRunning;
+    assert(r[4]==unsigned(B::Action::Release) && r[9]==1 && r[11]==unsigned(reason) && r[12]==0 && (r[10]&1) && !(r[10]&8));}
+   // Released: the next callbacks are the donor's, with the plane left to it.
+   assert(!power(f,2) && mmio(B::PlaneCtl)==dark);
+   assert(!locked && objectRefs.empty());++scenarios;
+  }
+ // System sleep stays the donor's: Off is entered through prepareToEnterSleep
+ // and left through prepareToExitSleep, which own IOGraphics' sleep/wake
+ // handshake. Sleeping from an awake panel: the donor's Wake -> Off, the
+ // hardware untouched.
+ {Fixture f(0,0,0);Map map;blankPrepare(f,map);
+  assert(!power(f,0) && result==0xFFFFFFFFU && powerOf(f)==2 && mmio(B::PlaneCtl)==livePlane && mmio(B::CurCtl)==liveCursor);
+  {const auto r=blankRecord();assert(r[1]==0 && r[2]==2 && r[4]==unsigned(B::Action::Native) && r[5]==0 && r[9]==0);}
+  // The donor's Off, then its DarkWake doze and full wake over a reset display:
+  // every callback is the donor's, none touches pipe A.
+  put(f.fb,0x4284,0U);scanoutChain(0,0,0);mmio(B::PlaneCtl)=0;mmio(B::CurCtl)=0;
+  assert(!power(f,1) && powerOf(f)==0 && blankRecord()[4]==unsigned(B::Action::Native));
+  put(f.fb,0x4284,1U);
+  assert(!power(f,2) && powerOf(f)==1 && blankRecord()[4]==unsigned(B::Action::Native));
+  put(f.fb,0x4284,0U);
+  assert(!power(f,2) && powerOf(f)==0 && mmio(B::PlaneCtl)==0 && mmio(B::CurCtl)==0);
+  assert(display13EDPBlankState.blanks==0 && !display13EDPBlankState.blanked);
+  // Back after the donor's own wake (here: the chain running again): display sleep blanks again.
+  put(f.fb,0x4284,2U);blankLive();
+  assert(power(f,1) && powerOf(f)==1 && display13EDPBlankState.blanks==1);
+  assert(!locked && objectRefs.empty());++scenarios;}
+ // Sleeping from display sleep: the blank is released without a register
+ // write, and the donor gets Wake back over the still running pipe, so that its
+ // Wake -> Off also runs prepareToExitWake before prepareToEnterSleep.
+ {Fixture f(0,0,0);Map map;blankPrepare(f,map);
+  assert(power(f,1) && powerOf(f)==1);const auto dark=mmio(B::PlaneCtl);
+  assert(!power(f,0) && result==0xFFFFFFFFU && powerOf(f)==2 && mmio(B::PlaneCtl)==dark && !(dark&B::PlaneEnable));
+  assert(!(mmio(B::CurCtl)&B::CursorMode) && !display13EDPBlankState.blanked && !display13EDPBlankState.fb);
+  assert(display13EDPBlankState.releases==1 && display13EDPBlankState.sleepReleases==1 && display13EDPBlankState.unblanks==0);
+  {const auto r=blankRecord();
+   assert(r[1]==0 && r[2]==1 && r[4]==unsigned(B::Action::Release) && r[9]==1 && r[10]==15 && r[11]==unsigned(B::Reason::SystemSleep) && r[12]==1);}
+  assert(!locked && objectRefs.empty());++scenarios;}
+ // The pipe already stopped by then: the donor keeps the doze it was told.
+ {Fixture f(0,0,0);Map map;blankPrepare(f,map);
+  assert(power(f,1));scanoutChain(0,0,0);
+  assert(!power(f,0) && powerOf(f)==1 && display13EDPBlankState.sleepReleases==1);
+  {const auto r=blankRecord();assert(r[4]==unsigned(B::Action::Release) && r[10]==3 && r[11]==unsigned(B::Reason::SystemSleep));}
+  assert(!locked && objectRefs.empty());++scenarios;}
+ // A blank still in place when the donor reports Off (a sleep entered by the
+ // donor without this callback) is released on the way out as well.
+ for(uint32_t st:{1U,2U}) {
   Fixture f(0,0,0);Map map;blankPrepare(f,map);
-  assert(power(f,1));const auto dark=mmio(B::PlaneCtl);
-  if(variant==0)display13FBPower.bridge.state.suspended=true;
-  else if(variant==1)display13FBPower.bridge.state.faulted=true;
-  else put(f.path,0x3640,1U);
-  assert(!power(f,2) && mmio(B::PlaneCtl)==dark && !(dark&B::PlaneEnable) && !display13EDPBlankState.blanked);
-  assert(display13EDPBlankState.forgets==1 && display13EDPBlankState.unblanks==0 && powerOf(f)==1);
-  {const auto r=blankRecord();assert(r[4]==unsigned(B::Action::Unblank) && r[9]==1 && r[10]==1);}
+  assert(power(f,1));put(f.fb,0x4284,0U);scanoutChain(0,0,0);
+  assert(!power(f,st) && powerOf(f)==0 && !display13EDPBlankState.blanked && display13EDPBlankState.sleepReleases==1);
+  {const auto r=blankRecord();assert(r[2]==0 && r[4]==unsigned(B::Action::Release) && r[11]==unsigned(B::Reason::SystemSleep) && !(r[10]&8));}
   assert(!locked && objectRefs.empty());++scenarios;
  }
  // The hardware window must be the whole 16 MB BAR0.
@@ -295,7 +382,7 @@ void blankScenarios() {
   state.orgDisplay13RegsNeedUpdate=0;assert(!XE::display13EDPBlankReady());
   state.orgDisplay13RegsNeedUpdate=reinterpret_cast<uintptr_t>(nativeRegs);state.adlnOutputWiring.panel=0;assert(!XE::display13EDPBlankReady());
   ++scenarios;}
- printf("PASS Display13 eDP blank: plane/cursor blank and unblank in place of the donor's Doze/Wake, eligibility, never left dark, other framebuffers and powered-down hardware leave pipe A alone (%u scenarios)\n",scenarios);
+ printf("PASS Display13 eDP blank: plane/cursor blank and unblank in place of the donor's Doze/Wake, eligibility, never left dark, system sleep and a stopped scanout chain left to the donor, other framebuffers leave pipe A alone (%u scenarios)\n",scenarios);
 }
 // Without -wex-edp-keep the decision is the donor's, unrecorded.
 void offScenario() {

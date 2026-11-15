@@ -83,7 +83,7 @@ These settings are unnecessary at 96MB and do not increase firmware-allocated me
 - Add `SSDT-PNLF` for internal-display brightness control.
 - GPU selection is automatic; a `device-id` override is normally unnecessary.
 - Alder Lake-N / Twin Lake and Alder Lake-H/P/U / Raptor Lake-H/P/U select tiling automatically. Do not use `-yTileDisable`; `AAPL,GfxYTile` is unnecessary.
-- If an Alder Lake-H/P/U / Raptor Lake-H/P/U internal panel goes dark when macOS takes over the boot screen, add `-wex-edp-keep` and set OpenCore `UEFI > Output > Resolution` to `Max`. WEX then keeps the panel link the firmware trained instead of training it again; a scaled resolution keeps that link and changes only the pipe scaler. For display sleep also add `-wex-edp-blank`: the panel stays powered and its link keeps running, and only scanning out stops, so the screen shows black (an OLED emits no light). Without it, disable display sleep. With it, system sleep blanks the panel the same way.
+- If an Alder Lake-H/P/U / Raptor Lake-H/P/U internal panel goes dark when macOS takes over the boot screen, add `-wex-edp-keep` and set OpenCore `UEFI > Output > Resolution` to `Max`. WEX then keeps the panel link the firmware trained instead of training it again; a scaled resolution keeps that link and changes only the pipe scaler. For display sleep also add `-wex-edp-blank`: the panel stays powered and its link keeps running, and only scanning out stops, so the screen shows black (an OLED emits no light). Without it, disable display sleep. System sleep is left to the driver's own sleep and wake sequence.
 
 ## Tested features and known issues
 
@@ -110,7 +110,7 @@ System sleep/wake support is **experimental**. Tested configurations are MiniBoo
 - Some image-conversion operations can crash applications.
 - Safari video may occasionally drop frames. FairPlay-protected playback is unsupported.
 - Up to three displays are supported. Resolutions beyond the tested configurations remain unverified.
-- With `-wex-edp-keep`, display sleep without `-wex-edp-blank`, or a mode with a different refresh rate or color depth, trains the panel link again and can leave the internal panel dark. System sleep that powers the display hardware off is untested with `-wex-edp-blank`.
+- With `-wex-edp-keep`, display sleep without `-wex-edp-blank`, the wake from system sleep, or a mode with a different refresh rate or color depth trains the panel link again and can leave the internal panel dark.
 - Some connector layouts and backlight methods, MST and Thunderbolt-managed outputs are unsupported.
 
 ### Roadmap
