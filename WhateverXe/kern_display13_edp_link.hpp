@@ -64,6 +64,23 @@
 // and later), and clears it otherwise (intel_dp_aux_fill_hdr_tcon_params).
 // WEX sets 0x344 after the panel trains as Linux does. The ATNA40CT01 offers
 // it and powers up with 0x344 = 0x90; the GOP leaves 0x10.
+//
+// Link rate and depth with -wex-edp-keep. The donor trains the panel at the
+// fastest rate it lists and at the depth of its EDID (the ATNA40CT01 at
+// 5.4 Gbps and 10 bpc); a kept link must be the one the firmware runs (the
+// ATNA40CT01 at 2.7 Gbps and 8 bpc). With -wex-edp-keep WEX shows the donor
+// the panel as the firmware runs it: the rates it lists capped at the
+// firmware's (Display13EDPKeep::capLinkCaps) and the depth of its EDID and
+// mode at the firmware's; HBR and 8 bpc when the firmware's are not known.
+// Without it the donor keeps its own rate and depth.
+// The firmware, like Linux, selects an eDP 1.4 panel's rate with
+// LINK_RATE_SET (0x115), an index into SUPPORTED_LINK_RATES (0x010, eight
+// little-endian entries in 200 kHz units, ascending, 0 ends the list); the
+// donor only writes LINK_BW_SET (0x100). The ATNA40CT01 follows LINK_RATE_SET:
+// the firmware leaves LINK_BW_SET 0x14 next to LINK_RATE_SET 3 and the link
+// runs at 2.7 Gbps (DPLL0 at 1350 MHz). The firmware's depth is the one its
+// transcoder sends to the panel's DDI (TRANS_DDI_FUNC_CTL) at the boot
+// handoff.
 #ifndef kern_display13_edp_link_hpp
 #define kern_display13_edp_link_hpp
 #include <stdint.h>
@@ -221,5 +238,54 @@ template<class Read,class Delay> uint32_t waitBufferActive(Read read,Delay delay
         delay(BufferPollUs);waited+=BufferPollUs;
     }
 }
+
+// The firmware's link format on the panel, as -wex-edp-keep shows it to the donor.
+constexpr uint32_t SupportedLinkRates=0x010, RateEntries=8, LinkRateSet=0x115;
+constexpr uint32_t BWUnit=1350; // One LINK_BW_SET step, 0.27 Gbps, in the table's 200 kHz units.
+struct Firmware {
+    uint32_t depth {};          // Bits per component the firmware sends, 0 unknown.
+    uint32_t func {UINT32_MAX}; // Its TRANS_DDI_FUNC_CTL at the boot handoff.
+    uint32_t rate {};           // The rate it runs, in 200 kHz units, 0 unknown.
+    uint8_t bw {};              // That rate as a LINK_BW_SET code, 0 if the donor has none.
+    uint8_t linkBW {}, rateSet {}; // LINK_BW_SET and LINK_RATE_SET as the firmware left them.
+    bool read {};               // The panel's link settings were read (once, at the donor's first read).
+};
+inline bool standardBW(uint32_t code) {return code==0x06 || code==0x0A || code==0x14 || code==0x1E;}
+// The rate the firmware runs the panel at, in 200 kHz units, 0 if unknown.
+// A valid index into the panel's table is the rate select method when
+// LINK_BW_SET is 0 and, when it is not, a later choice than a stale
+// LINK_BW_SET; index 0 next to a LINK_BW_SET is that LINK_BW_SET's rate. A
+// table that does not ascend is no table.
+inline uint32_t firmwareRate(const uint8_t *table,uint8_t linkBW,uint8_t rateSet) {
+    if(table && (rateSet || !linkBW)) {
+        uint32_t entries=0,previous=0;
+        for(;entries<RateEntries;++entries) {
+            const uint32_t rate=table[2*entries]|(uint32_t(table[2*entries+1])<<8);
+            if(!rate)break;
+            if(rate<=previous) {entries=0;break;}
+            previous=rate;
+        }
+        if(rateSet<entries)return table[2*rateSet]|(uint32_t(table[2*rateSet+1])<<8);
+        if(!linkBW)return 0;
+    }
+    return standardBW(linkBW) ? linkBW*BWUnit : 0;
+}
+// That rate as a LINK_BW_SET code; 0 when the donor cannot set it.
+inline uint8_t firmwareBW(uint32_t rate) {
+    return rate && !(rate%BWUnit) && standardBW(rate/BWUnit) ? uint8_t(rate/BWUnit) : 0;
+}
+// The depth a transcoder sends to the panel's DDI: enabled, that DDI's port
+// select (bits 30:27, DDI + 1), DisplayPort SST (bits 26:24 = 2), bits per
+// component from bits 22:20. 0 when the transcoder does not drive it so.
+inline uint32_t firmwareDepth(uint32_t func,uint32_t ddi) {
+    static constexpr uint32_t bpc[8]={8,10,6,12,0,0,0,0};
+    if(func==UINT32_MAX || !(func&0x80000000U) || ((func>>27)&0xF)!=ddi+1 || ((func>>24)&7)!=2)return 0;
+    return bpc[(func>>20)&7];
+}
+// The format WEX shows the donor: with -wex-edp-keep the firmware's rate and
+// depth when both are known, HBR and 8 bpc otherwise; without it the panel's
+// own (0).
+inline uint8_t viewBW(const Firmware &f,bool keep) {return !keep ? 0 : f.bw && f.depth ? f.bw : 0x0A;}
+inline uint32_t viewDepth(const Firmware &f,bool keep) {return !keep ? 0 : f.bw && f.depth ? f.depth : 8;}
 }
 #endif

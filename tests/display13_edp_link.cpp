@@ -187,6 +187,31 @@ int main() {
         assert(!restore(Backlight{},0,0).control);
         ++cases;
     }
+    // The firmware's link format. The ATNA40CT01 as the IdeaPad's firmware
+    // leaves it: LINK_BW_SET 0x14 next to LINK_RATE_SET 3 (2.7 Gbps), 8 bpc
+    // on DDI A (TRANS_DDI_FUNC_CTL 0x8A010102); the donor's own link at
+    // 5.4 Gbps and 10 bpc is 0x8A110102.
+    {
+        const uint8_t table[16]={0xa4,0x1f,0x30,0x2a,0x76,0x2f,0xbc,0x34,0x48,0x3f,0x60,0x54,0x78,0x69,0,0};
+        assert(firmwareRate(table,0x14,3)==13500 && firmwareBW(13500)==0x0A);
+        assert(firmwareRate(table,0,0)==8100 && firmwareRate(table,0,6)==27000 && firmwareBW(27000)==0x14);
+        assert(firmwareRate(table,0x14,0)==27000);           // index 0 next to LINK_BW_SET: its rate
+        assert(firmwareRate(table,0x0A,7)==10*BWUnit);        // index past the table: LINK_BW_SET
+        assert(!firmwareRate(table,0,7) && !firmwareRate(table,0x0C,0) && !firmwareRate(nullptr,0,0));
+        assert(firmwareRate(nullptr,0x14,3)==27000);
+        const uint8_t unordered[16]={0x30,0x2a,0xa4,0x1f};assert(firmwareRate(unordered,0x0A,1)==13500);
+        assert(!firmwareRate(unordered,0,1));
+        assert(firmwareRate(table,0x14,4)==16200 && !firmwareBW(16200) && !firmwareBW(0) && firmwareBW(8100)==0x06);
+        assert(firmwareDepth(0x8A010102,0)==8 && firmwareDepth(0x8A110102,0)==10 && firmwareDepth(0x8A210102,0)==6);
+        assert(!firmwareDepth(0x8A010102,1) && !firmwareDepth(0x0A010102,0) && !firmwareDepth(UINT32_MAX,0));
+        assert(!firmwareDepth(0x89010102,0) && firmwareDepth(0x92010102,1)==8 && !firmwareDepth(0x8A410102,0));
+        Firmware f;assert(!viewBW(f,false) && !viewDepth(f,false) && viewBW(f,true)==0x0A && viewDepth(f,true)==8);
+        f.bw=0x14;assert(viewBW(f,true)==0x0A && viewDepth(f,true)==8);  // both or neither
+        f.depth=10;assert(viewBW(f,true)==0x14 && viewDepth(f,true)==10);
+        assert(!viewBW(f,false) && !viewDepth(f,false));                // without keep: the panel's own
+        f.bw=0;assert(viewBW(f,true)==0x0A && viewDepth(f,true)==8);
+        ++cases;
+    }
     printf("display13_edp_link: ok (%u cases)\n",cases);
     return 0;
 }

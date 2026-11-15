@@ -214,6 +214,8 @@ private:
  static uint32_t wrapDisplay13WriteAUX(void *port,uint32_t address,void *data,uint32_t length);
  static void display13EDPTrained(void *port);
  static uint32_t display13EDPIntelOUI(void *port);
+ static void display13EDPFirmwareRead(void *port);
+ static uint32_t display13EDPDepth();
  static uint32_t wrapDisplay13I2CAUX(void *port,uint32_t command,uint32_t *packet,uint32_t length,uint8_t flag);
  static uint32_t wrapDisplay13RunAUX(void *port,uint32_t command,uint32_t *packet,uint32_t length,bool flag);
  mach_vm_address_t orgDisplay13TrainingPattern {},orgDisplay13SignalLevels {};

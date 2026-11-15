@@ -118,7 +118,13 @@ int main() {
      // A read that only partly covers a field caps what it covers.
      uint8_t low[1]={0x60};capLinkCaps(0x1A,low,1);assert(low[0]==0x60);
      uint8_t pair[2]={0x60,0x54};capLinkCaps(0x1A,pair,2);assert(!pair[0] && !pair[1]);
-     capLinkCaps(0,nullptr,16);}
+     capLinkCaps(0,nullptr,16);
+     // Capped at the firmware's rate: HBR2 leaves the panel's own caps, 0 caps nothing.
+     uint8_t caps2[2]={0x14,0x14};capLinkCaps(0,caps2,2,0x14);assert(caps2[1]==0x14);
+     uint8_t rates2[16]={0xa4,0x1f,0x30,0x2a,0x76,0x2f,0xbc,0x34,0x48,0x3f,0x60,0x54,0x78,0x69,0,0};
+     capLinkCaps(0x10,rates2,16,0x14);assert(rates2[12]==0x78 && rates2[13]==0x69);
+     capLinkCaps(0x10,rates2,16,0x06);assert(rates2[0]==0xa4 && !rates2[2] && !rates2[3]);
+     uint8_t bw2[1]={0x14};capLinkCaps(0x100,bw2,1,0);assert(bw2[0]==0x14);}
     // EDID 1.4 DisplayPort 10 bpc -> 8 bpc with a valid checksum; 8 bpc, 6 bpc,
     // analog or non-EDID data unchanged.
     {uint8_t edid[128]={0,255,255,255,255,255,255,0};edid[18]=1;edid[19]=4;edid[20]=0xB5;
@@ -128,6 +134,11 @@ int main() {
      edid[20]=0x95;assert(!edid8bpc(edid) && edid[20]==0x95);
      edid[20]=0x35;assert(!edid8bpc(edid));
      edid[19]=3;edid[20]=0xB5;assert(!edid8bpc(edid));edid[19]=4;
-     edid[0]=1;assert(!edid8bpc(edid));assert(!edid8bpc(nullptr));}
+     edid[0]=1;assert(!edid8bpc(edid));assert(!edid8bpc(nullptr));edid[0]=0;
+     // Any firmware depth from 6 to 12 bpc, only downwards.
+     edid[20]=0xC5;sum=0;for(unsigned i=0;i<127;++i)sum+=edid[i];edid[127]=uint8_t(-sum);
+     assert(edidDepth(edid,10) && edid[20]==0xB5);sum=0;for(unsigned i=0;i<128;++i)sum+=edid[i];assert(!(sum&255));
+     assert(!edidDepth(edid,12) && !edidDepth(edid,10) && edidDepth(edid,6) && edid[20]==0x95);
+     assert(!edidDepth(edid,0) && !edidDepth(edid,7) && !edidDepth(edid,14) && edid[20]==0x95);}
     printf("PASS Display13 eDP keep: firmware link kept only for the same active image and link format\n");
 }

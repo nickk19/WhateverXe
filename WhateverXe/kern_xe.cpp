@@ -7457,6 +7457,17 @@ static uint32_t display13EDPBacklightLast[6]={UINT32_MAX,UINT32_MAX,0,UINT32_MAX
 // Intel's OUI written to the panel: count and last result; donor source
 // identifications kept off the panel.
 static uint32_t display13EDPOUIWrites=0,display13EDPOUILast=UINT32_MAX,display13EDPOUIReplaced=0;
+// The panel link format the firmware runs (kern_display13_edp_link.hpp): its
+// depth from the boot handoff, its rate from the panel's link settings at the
+// donor's first read of the panel. WEXEDPFirmwareLink: version 1, depth, rate
+// (200 kHz units), LINK_BW_SET code, LINK_BW_SET and LINK_RATE_SET read,
+// settings read, TRANS_DDI_FUNC_CTL, the rate and depth the donor is shown.
+static Display13EDPLink::Firmware display13EDPFirmware;
+static void display13EDPFirmwarePublish(bool keep) {
+ namespace L=Display13EDPLink;const auto &f=display13EDPFirmware;
+ uint32_t record[10]={1,f.depth,f.rate,f.bw,f.linkBW,f.rateSet,f.read,f.func,L::viewBW(f,keep),L::viewDepth(f,keep)};
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPFirmwareLink",record,sizeof(record));
+}
 static void display13EDPBacklightPublish() {
  const auto &b=display13EDPBacklight;const auto *l=display13EDPBacklightLast;
  uint32_t record[17]={2,b.known,b.firmwareAux,b.firmwareOUI,b.firmwareControl,b.firmwareNits,b.lastNits,
@@ -7470,6 +7481,20 @@ static void display13EDPLinkPublish() {
   o.holds,o.joined,o.delivered,o.replaced,display13EDPOrderLast[0],display13EDPOrderLast[1],display13EDPOrderLast[2]};
  IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPLink",record,sizeof(record));
 }
+// The panel's link settings as the firmware left them, read once at the
+// donor's first read of the panel, before any of its link setup.
+void XE::display13EDPFirmwareRead(void *port) {
+ namespace L=Display13EDPLink;auto &f=display13EDPFirmware;
+ const auto read=FunctionCast(wrapDisplay13ReadAUX,callbackXE->orgDisplay13ReadAUX);
+ uint8_t table[2*L::RateEntries]={},bw=0,set=0;
+ if(!read(port,L::SupportedLinkRates,table,sizeof(table)) && !read(port,L::LinkBWSet,&bw,1) &&
+    !read(port,L::LinkRateSet,&set,1)) {
+  f.linkBW=bw;f.rateSet=set;f.rate=L::firmwareRate(table,bw,set);f.bw=L::firmwareBW(f.rate);
+ }
+ display13EDPFirmwarePublish(display13EDPKeepActive());
+}
+// The depth the donor is shown on the panel, 0 for the panel's own.
+uint32_t XE::display13EDPDepth() {return Display13EDPLink::viewDepth(display13EDPFirmware,display13EDPKeepActive());}
 // Intel's OUI on the panel, written only when the panel does not have it
 // (intel_dp_init_source_oui). Returns the result of the read, or of the write.
 uint32_t XE::display13EDPIntelOUI(void *port) {
@@ -7496,12 +7521,16 @@ uint32_t XE::wrapDisplay13ReadAUX(void *port,uint32_t address,void *data,uint32_
  IOLockLock(c.lock);const bool complete=display13AUXReady(port,false);
  const auto ddi=complete ? Display13FBMemory::field<uint32_t>(port,0x120) : UINT32_MAX;
  const bool panel=ddi<2 && (callbackXE->adlnOutputWiring.panel&(1U<<ddi));IOLockUnlock(c.lock);
+ if(!r && complete && panel && !__atomic_exchange_n(&display13EDPFirmware.read,true,__ATOMIC_ACQ_REL))
+  display13EDPFirmwareRead(port);
  if(!r && complete && panel) {
   const auto before=display13EDPLink.assrHidden+display13EDPLink.intervalMasked+display13EDPLink.tps4Hidden;
   L::view(display13EDPLink,address,static_cast<uint8_t *>(data),length);
   if(display13EDPLink.assrHidden+display13EDPLink.intervalMasked+display13EDPLink.tps4Hidden!=before)display13EDPLinkPublish();
  }
- if(!r && complete && panel && display13EDPKeepActive())Display13EDPKeep::capLinkCaps(address,static_cast<uint8_t *>(data),length);
+ // With -wex-edp-keep, the panel's rates as the firmware runs it.
+ if(!r && complete && panel)
+  Display13EDPKeep::capLinkCaps(address,static_cast<uint8_t *>(data),length,L::viewBW(display13EDPFirmware,display13EDPKeepActive()));
  if(!r && complete && panel)L::level(display13EDPBacklight,address,static_cast<const uint8_t *>(data),length);
  // The firmware's brightness over AUX, while the panel still has it: at the
  // donor's first read of the receiver caps.
@@ -8652,9 +8681,9 @@ uint32_t XE::wrapAlderLakeNPortDDC(OSObject *port,uint32_t block,uint8_t *data,b
     uint64_t r[8] {1,block,force,0,0,config ? config[0] : 9};
     auto root=IORegistryEntry::getRegistryRoot();if(selected)root->setProperty("N97FBPortDDCEntry",r,sizeof(r));
     const auto result=FunctionCast(wrapAlderLakeNPortDDC,callbackXE->orgAlderLakeNPortDDC)(port,block,data,force);r[3]=result;
-    // -wex-edp-keep: the panel EDID's depth as the firmware runs it (8 bpc).
-    if(!result && block==1 && selected && config && config[0]<2 &&
-       (callbackXE->adlnOutputWiring.panel&(1U<<config[0])) && display13EDPKeepActive())Display13EDPKeep::edid8bpc(data);
+    // With -wex-edp-keep, the panel EDID's depth as the firmware runs it (kern_display13_edp_link.hpp).
+    if(!result && block==1 && selected && config && config[0]<2 && (callbackXE->adlnOutputWiring.panel&(1U<<config[0])))
+        Display13EDPKeep::edidDepth(data,display13EDPDepth());
     cachePanelDepth(port,block,data,result);
     if(selected) {
         if(!result && data && (block==1 || block==2)) {
@@ -8692,6 +8721,11 @@ bool XE::prepareDisplay13BootScanout(IOPCIDevice *pci) {
     const auto ddi=Display13FBTopology::bootstrapDDI(adlnOutputWiring,
         boot.status==AlderLakeN::ReadoutStatus::Complete,boot.poweredPipes,boot.activePipes,trans,true);
     const bool dp=ddi<7 && (adlnOutputWiring.links()&(1U<<ddi));
+    // The depth the firmware sends to the panel, before the donor's mode set.
+    if(ddi<2 && (adlnOutputWiring.panel&(1U<<ddi))) {
+        display13EDPFirmware.func=trans;display13EDPFirmware.depth=Display13EDPLink::firmwareDepth(trans,ddi);
+        display13EDPFirmwarePublish(display13EDPKeepActive());
+    }
     auto tc=Display13TC::Boot::capture(io,mapped && ddi>=3,ddi,0,dp);
     if(ddi>=3 && ddi<7)pci->setProperty("WEXDisplay13TCBoot",&tc,sizeof(tc));
     auto result=Display13Boot::prepareLinear(io,boot,mapped,ddi,xelpMemory,ddi>=3?&tc:nullptr,
@@ -18091,8 +18125,9 @@ void XE::wrapTGLModeTiming(void *controller,void *fb,void *timing) {
  IOSimpleLockLock(tglAUXLock);
  auto maximum=tglPanelDepthCache[ddi].port==port ? tglPanelDepthCache[ddi].maximum : 0;
  IOSimpleLockUnlock(tglAUXLock);
- // -wex-edp-keep: the mode set requests the firmware's 8 bpc on the panel.
- if(display13EDPKeepActive() && (callbackXE->adlnOutputWiring.panel&(1U<<ddi)) && (!maximum || maximum>8))maximum=8;
+ // With -wex-edp-keep, the mode set requests the firmware's depth on the panel (kern_display13_edp_link.hpp).
+ const auto firmware=(callbackXE->adlnOutputWiring.panel&(1U<<ddi)) ? display13EDPDepth() : 0;
+ if(firmware && (!maximum || maximum>firmware))maximum=firmware;
  const auto encoding=*reinterpret_cast<uint16_t *>(t+0x88);
  auto &depth=*reinterpret_cast<uint16_t *>(t+0x8A);
  const auto before=depth;

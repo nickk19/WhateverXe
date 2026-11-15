@@ -84,34 +84,38 @@ inline bool sinkTrained(const uint8_t *status,uint32_t lanes) {
  return status[2]&1;
 }
 // The panel's receiver caps as the donor's getDPCDInfo and link setup read
-// them, capped at HBR: MAX_LINK_RATE in the receiver caps (0x001) and the
-// extended caps (0x2201), the eDP 1.4 SUPPORTED_LINK_RATES table (0x010, 200 kHz
-// units, ascending, 0 ends it; getDPCDInfo prefers its highest entry over
+// them, capped at a LINK_BW_SET code (the firmware's rate; HBR, 0x0A, for the
+// kept link): MAX_LINK_RATE in the receiver caps (0x001) and the extended caps
+// (0x2201), the eDP 1.4 SUPPORTED_LINK_RATES table (0x010, 200 kHz units,
+// ascending, 0 ends it; getDPCDInfo prefers its highest entry over
 // MAX_LINK_RATE) and the LINK_BW_SET the donor reads back and reuses (0x100).
 // At HBR setupOptimalLaneCount gives a 1920x1200@60 8 bpc mode the firmware's
 // two lanes (one at HBR2). Nothing is written to the sink.
-inline void capLinkCaps(uint32_t address,uint8_t *data,uint32_t length) {
- if(!data || !length)return;
+inline void capLinkCaps(uint32_t address,uint8_t *data,uint32_t length,uint8_t bw=0x0A) {
+ if(!data || !length || !bw)return;
  const auto at=[&](uint32_t reg)->uint8_t *{return reg>=address && reg-address<length ? data+(reg-address) : nullptr;};
  const uint32_t rates[]={0x001U,0x2201U,0x100U};
- for(const auto reg:rates)if(auto b=at(reg); b && *b>0x0AU)*b=0x0A;
+ for(const auto reg:rates)if(auto b=at(reg); b && *b>bw)*b=bw;
  for(uint32_t i=0;i<8;++i) {
   auto lo=at(0x10+2*i),hi=at(0x11+2*i);
-  if(lo && hi && uint32_t(*lo|(*hi<<8))>13500U)*lo=*hi=0;
+  if(lo && hi && uint32_t(*lo|(*hi<<8))>1350U*bw)*lo=*hi=0;
  }
 }
 // The panel EDID's DisplayPort color depth (EDID 1.4 video input definition,
-// bits 6:4) reported as 8 bits per component when it says more, with the
-// checksum fixed, so AGDC policy, mode validation and the mode set agree on the
-// firmware's depth. Anything but a digital EDID 1.4 base block is unchanged.
-inline bool edid8bpc(uint8_t *edid) {
+// bits 6:4) reported as the firmware's bits per component (6 to 12) when it
+// says more, with the checksum fixed, so AGDC policy, mode validation and the
+// mode set agree on the firmware's depth. Anything but a digital EDID 1.4
+// base block is unchanged.
+inline bool edidDepth(uint8_t *edid,uint32_t bpc) {
  static const uint8_t header[]={0,255,255,255,255,255,255,0};
- if(!edid || __builtin_memcmp(edid,header,sizeof(header)) || edid[18]!=1 || edid[19]<4 ||
-    !(edid[20]&0x80) || ((edid[20]>>4)&7)<=2)return false;
- edid[20]=uint8_t((edid[20]&0x8F)|0x20);
+ const uint32_t code=bpc>=6 && bpc<=12 && !(bpc&1) ? bpc/2-2 : 0;
+ if(!code || !edid || __builtin_memcmp(edid,header,sizeof(header)) || edid[18]!=1 || edid[19]<4 ||
+    !(edid[20]&0x80) || ((edid[20]>>4)&7)<=code)return false;
+ edid[20]=uint8_t((edid[20]&0x8F)|(code<<4));
  uint32_t sum=0;for(unsigned i=0;i<127;++i)sum+=edid[i];
  edid[127]=uint8_t(-sum);
  return true;
 }
+inline bool edid8bpc(uint8_t *edid) {return edidDepth(edid,8);}
 }
 #endif

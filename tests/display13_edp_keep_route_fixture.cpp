@@ -48,6 +48,7 @@ void edpSetup(Fixture &f,Map &map,bool panel=true){
  display13EDPOrder={};display13EDPOrderLast[0]=display13EDPOrderLast[1]=0;display13EDPOrderLast[2]=UINT32_MAX;
  testOnDelay()=nullptr;testDelayedUs()=0;
  display13EDPBacklight={};display13EDPBacklightRestores=0;display13EDPOUIWrites=display13EDPOUIReplaced=0;
+ display13EDPFirmware={};
 }
 // getDPCDInfo and the link setup read the receiver caps, the extended caps,
 // the rate table and the LINK_BW_SET they reuse. Under -wex-edp-keep every view
@@ -69,6 +70,43 @@ void capsScenarios(bool keep,bool hook=true){
  // Only the donor's view changes: the sink keeps its own values.
  assert(sink.dpcd[0x1]==0x14 && sink.dpcd[0x100]==0x14 && sink.dpcd[0xD]==0x09 && sink.dpcd[3]==0xc1);
  assert(objectRefs.empty());
+}
+// The firmware's link format (kern_display13_edp_link.hpp). With its depth
+// from the boot handoff (TRANS_DDI_FUNC_CTL 0x8A010102: 8 bpc on DDI A) and
+// its rate from the panel's link settings at the donor's first read
+// (LINK_RATE_SET 3: 2.7 Gbps), -wex-edp-keep caps every view of the rates at
+// HBR; at the firmware's HBR2 the caps are the panel's; a rate or depth not
+// known leaves -wex-edp-keep's HBR. Without -wex-edp-keep the donor sees the
+// panel's own caps; the firmware's format is still read and published.
+void firmwareScenarios(bool keep){
+ const auto record=[](){auto &d=IORegistryEntry::getRegistryRoot()->data;auto i=d.find("WEXEDPFirmwareLink");
+  std::vector<uint32_t> r;if(i!=d.end()){r.resize(i->second.size()/4);memcpy(r.data(),i->second.data(),r.size()*4);}return r;};
+ const auto read=[](void *port,uint8_t *caps,uint8_t *rates,uint8_t *bw){
+  return !XE::wrapDisplay13ReadAUX(port,0,caps,16) && !XE::wrapDisplay13ReadAUX(port,0x10,rates,16) &&
+         !XE::wrapDisplay13ReadAUX(port,0x100,bw,2);};
+ uint8_t caps[16],rates[16],bw[2];
+ {Fixture f(0,0,0);Map map;edpSetup(f,map);state.orgDisplay13RegsNeedUpdate=1;display13EDPFirmware.func=0x8A010102;display13EDPFirmware.depth=8;
+  assert(read(f.port,caps,rates,bw) && caps[1]==(keep?0x0A:0x14) && bw[0]==(keep?0x0A:0x14) && bw[1]==0x82);
+  for(unsigned i=0;i<16;++i)assert(rates[i]==(keep && i>=8 ? 0 : sink.dpcd[0x10+i]));
+  assert((record()==std::vector<uint32_t>{1,8,13500,0x0A,0x14,3,1,0x8A010102,keep?0x0Au:0u,keep?8u:0u}));
+  // Read once: a later LINK_RATE_SET does not change the firmware's rate.
+  sink.dpcd[0x115]=6;assert(read(f.port,caps,rates,bw) && caps[1]==(keep?0x0A:0x14) && record()[2]==13500);
+  // The panel itself is not written.
+  assert(sink.dpcd[1]==0x14 && sink.dpcd[0x100]==0x14 && sinkWrites.log.empty());}
+ {Fixture f(0,0,0);Map map;edpSetup(f,map);state.orgDisplay13RegsNeedUpdate=1;sink.dpcd[0x115]=6;display13EDPFirmware.func=0x8A110102;display13EDPFirmware.depth=10;
+  assert(read(f.port,caps,rates,bw) && caps[1]==0x14 && bw[0]==0x14 && rates[12]==0x78 && rates[13]==0x69);
+  assert((record()==std::vector<uint32_t>{1,10,27000,0x14,0x14,6,1,0x8A110102,keep?0x14u:0u,keep?10u:0u}));}
+ // A link setting the panel does not return, or no depth: no firmware view.
+ {Fixture f(0,0,0);Map map;edpSetup(f,map);state.orgDisplay13RegsNeedUpdate=1;sink.failingRead=0x115;display13EDPFirmware.depth=8;
+  uint8_t c[16];assert(!XE::wrapDisplay13ReadAUX(f.port,0,c,16) && c[1]==(keep?0x0A:0x14));
+  const auto r=record();assert(r.size()==10 && r[1]==8 && !r[2] && !r[3] && r[6]==1 && r[8]==(keep?0x0Au:0u) && r[9]==(keep?8u:0u));}
+ {Fixture f(0,0,0);Map map;edpSetup(f,map);state.orgDisplay13RegsNeedUpdate=1;
+  assert(read(f.port,caps,rates,bw) && caps[1]==(keep?0x0A:0x14) && bw[0]==(keep?0x0A:0x14));
+  const auto r=record();assert(r[2]==13500 && r[3]==0x0A && !r[1]);}
+ // Only the panel DDI is read and capped.
+ {Fixture f(0,0,0);Map map;edpSetup(f,map,false);state.orgDisplay13RegsNeedUpdate=1;display13EDPFirmware.depth=8;
+  uint8_t c[16];assert(!XE::wrapDisplay13ReadAUX(f.port,0,c,16) && c[1]==0x14 && !display13EDPFirmware.read);}
+ printf("PASS Display13 eDP firmware link: read once, rates capped at the firmware's only with keep, the panel untouched (%s)\n",keep?"keep":"no keep");
 }
 // The donor's training pattern writes in the firmware's and Linux's order:
 // TRAINING_PATTERN_SET goes to the panel with the next TRAINING_LANEx_SET,
@@ -653,6 +691,7 @@ int main(int argc,char **argv){
  capsScenarios(keep);
  // A donor build the decision hook does not match keeps nothing: its caps stay native.
  capsScenarios(keep,false);
+ firmwareScenarios(keep);
  linkScenarios();
  if(keep){keepScenarios();blankScenarios();}else offScenario();
  return 0;

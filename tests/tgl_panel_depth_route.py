@@ -53,12 +53,14 @@ struct XE {
  Ports firmwarePorts;mach_vm_address_t orgTGLModeTiming;
  static uint32_t tglPanelDepthPort(void *);
  static void wrapTGLModeTiming(void *,void *,void *);
- static bool display13EDPKeepActive();
+ static uint32_t display13EDPDepth();
 } state,*callbackXE=&state;
 struct TGLPanelDepthCache {void *port;uint32_t maximum;};
 TGLPanelDepthCache tglPanelDepthCache[2];
 #define FunctionCast(f,p) reinterpret_cast<decltype(&f)>(p)
-bool keepArg=false,keepHook=true;bool XE::display13EDPKeepActive(){return keepArg && keepHook;}
+// The depth the donor is shown on the panel (kern_xe.cpp, Display13EDPLink::viewDepth).
+bool keepArg=false,keepHook=true;uint32_t firmwareDepth=0;
+uint32_t XE::display13EDPDepth(){return !(keepArg && keepHook) ? 0 : firmwareDepth ? firmwareDepth : 8;}
 PRODUCTION
 void native(void *,void *,void *){++calls;}
 template<class T> void put(uint8_t *p,unsigned off,T v){memcpy(p+off,&v,sizeof(v));}
@@ -104,6 +106,14 @@ int main(){
   assert(*reinterpret_cast<uint16_t *>(timing+0x8A)==(test==1?2:4) && record[1]==(test==1?8U:10U));
  }
  keepArg=false;keepHook=true;
+ // The firmware's depth with -wex-edp-keep, only on the panel DDI and only
+ // downwards; without it the EDID maximum stands.
+ for(unsigned test=0;test<5;++test){
+  firmwareDepth=test==3?10:8;keepArg=test!=4;state.adlnOutputWiring.panel=test==2?2:1;put(timing,0x8A,uint16_t(4));
+  XE::wrapTGLModeTiming(nullptr,fb,timing);
+  assert(*reinterpret_cast<uint16_t *>(timing+0x8A)==(test<2?2:4) && record[1]==(test<2?8U:10U));
+ }
+ firmwareDepth=0;keepArg=false;
  puts("PASS: production owner/port guards and unused-controller argument");
 }
 '''.replace('PRODUCTION',s[start:end])
